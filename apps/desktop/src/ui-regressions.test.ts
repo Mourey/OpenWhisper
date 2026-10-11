@@ -62,7 +62,7 @@ describe("desktop regression contracts", () => {
     expect(refresh).toContain("enumerateDevices()");
     expect(refresh).not.toContain("getUserMedia");
     expect(start).toBeDefined();
-    expect(start).not.toContain("capture_paste_target");
+    expect(start!.indexOf('invoke("capture_paste_target")')).toBeLessThan(start!.indexOf("recordingStartupVisible = true"));
     expect(start).toContain("revealWindow: () => applyOverlayLayout(true)");
     expect(start).toContain("return navigator.mediaDevices.getUserMedia(constraints)");
     expect(start).toContain("discard: (stream) => stream.getTracks().forEach((track) => track.stop())");
@@ -124,6 +124,7 @@ describe("desktop regression contracts", () => {
     expect(main).toContain('void listen("press-to-talk-cancel"');
     expect(main).toContain('void listen("recording-shortcut-status-changed"');
     expect(cancel).toContain("pressToTalkHeld = false");
+    expect(cancel).toContain("shouldPasteFinalTranscript = false");
     expect(cancel).toContain("cancellation.abort()");
     expect(cancel).toContain("await stopPcmCapture()");
     expect(cancel).not.toContain("finalizeRecording");
@@ -146,8 +147,8 @@ describe("desktop regression contracts", () => {
     expect(cleanup).toContain("if (currentRecordingCancellation !== cancellation) return");
     expect(cleanup).not.toContain("recordingCancellationCleanup = null");
     expect(poll).toMatch(/await finishCurrentRecording\("complete", finalTranscript, ""\);\n\s+if \(signal\?\.aborted \|\| currentSessionId !== sessionId\) return;/);
-    expect(poll).toMatch(/if \(signal\?\.aborted \|\| currentSessionId !== sessionId\) return;\n\s+lastTranscript = finalTranscript;/);
-    expect(poll).toMatch(/await invoke<void>\("copy_to_clipboard", \{ text: finalTranscript \}\);\n\s+const delivery = describeTranscriptDelivery\(isMac\);\n\s+if \(signal\?\.aborted \|\| currentSessionId !== sessionId\) return;/);
+    expect(poll).toContain("isCurrent: () => !signal?.aborted && currentSessionId === sessionId");
+    expect(poll).toContain('copy: () => invoke<void>("copy_to_clipboard", { text: finalTranscript })');
   });
 
   it("refreshes the stable local installer after every Windows build", () => {
@@ -213,16 +214,27 @@ describe("desktop regression contracts", () => {
     expect(recordingRule?.match(/box-shadow:/g)).toHaveLength(1);
   });
 
-  it("never inserts transcripts at the cursor; completed text is only copied", () => {
+  it("streams realtime transcript deltas into the previously focused field", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
 
     expect(main).not.toContain('id="live-transcript"');
-    for (const removed of ["paste_to_target", "replace_streamed_target", "capture_paste_target", "request_paste_access"]) {
-      expect(main).not.toContain(removed);
-    }
-    expect(main).toContain('invoke<void>("copy_to_clipboard", { text: finalTranscript })');
+    expect(main).toContain('invoke<PasteResult>("paste_to_target", { text: delta })');
+    expect(main).toContain('invoke<PasteResult>("replace_streamed_target"');
+    expect(main).toContain("import.meta.env.DEV");
+    expect(main).toContain("__openwhisperRealtimeSmoke");
     expect(css).not.toMatch(/\.live-transcript\s*\{/);
+  });
+
+  it("inserts the finished transcript at the cursor without a preview pill", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+    const poll = main.match(/async function pollOnce\(\) \{([\s\S]*?)\n\}/)?.[1];
+
+    expect(main).not.toMatch(/transcript-?preview/i);
+    expect(css).not.toContain("transcript-preview");
+    expect(poll).toContain('invoke<PasteResult>("paste_to_target", { text: finalTranscript })');
+    expect(poll).toContain("if (delivery.notice) showToast(delivery.notice");
   });
 
   it("asks before installing an update and reassures users that settings are kept", () => {

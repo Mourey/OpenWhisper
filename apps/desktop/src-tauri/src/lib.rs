@@ -1,4 +1,5 @@
 #[cfg(target_os = "macos")]
+mod macos_text_inserter;
 #[cfg(target_os = "macos")]
 mod modifier_hold;
 #[cfg(target_os = "macos")]
@@ -1769,10 +1770,102 @@ fn open_api_keys_page(app_handle: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn paste_to_target(text: String) -> Result<PasteResult, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(&text))
+        .map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    return Ok(macos_text_inserter::paste_to_captured_target(&text));
+
+    #[cfg(target_os = "windows")]
+    {
+        text_inserter::restore_and_paste();
+        Ok(PasteResult {
+            pasted: true,
+            reason: None,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    Ok(PasteResult {
+        pasted: false,
+        reason: Some("unsupported_target"),
+    })
+}
+
+#[cfg(target_os = "macos")]
+type PasteResult = macos_text_inserter::PasteOutcome;
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Serialize)]
+struct PasteResult {
+    pasted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+#[tauri::command]
+async fn request_paste_access(app_handle: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        app_handle
+            .run_on_main_thread(move || {
+                let _ = sender.send(macos_text_inserter::request_access());
+            })
+            .map_err(|error| error.to_string())?;
+        receiver.await.map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_handle;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
 fn copy_to_clipboard(text: String) -> Result<(), String> {
     arboard::Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(text))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn capture_paste_target() {
+    #[cfg(target_os = "windows")]
+    text_inserter::save_foreground();
+
+    #[cfg(target_os = "macos")]
+    macos_text_inserter::capture_target();
+}
+
+#[tauri::command]
+async fn replace_streamed_target(
+    streamed_text: String,
+    final_text: String,
+) -> Result<PasteResult, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(&final_text))
+        .map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "windows")]
+    {
+        text_inserter::restore_and_replace(streamed_text.chars().count());
+        Ok(PasteResult {
+            pasted: true,
+            reason: None,
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = streamed_text;
+        Ok(PasteResult {
+            pasted: false,
+            reason: Some("unsupported_target"),
+        })
+    }
 }
 
 #[tauri::command]
@@ -2212,7 +2305,11 @@ pub fn run() {
             debug_log,
             get_foreground_app,
             open_api_keys_page,
+            capture_paste_target,
+            request_paste_access,
             copy_to_clipboard,
+            paste_to_target,
+            replace_streamed_target,
             overlay_apply_layout
         ])
         .run(tauri::generate_context!())

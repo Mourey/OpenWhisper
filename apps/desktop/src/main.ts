@@ -41,10 +41,9 @@ import {
   throwIfRecordingCancelled,
 } from "./recording-cancellation";
 import {
-  createTranscriptPreview,
-  describeTranscriptDelivery,
-  withTranscriptPreviewLayout,
-} from "./transcript-preview";
+  deliverTranscript,
+  type PasteResult,
+} from "./transcript-delivery";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -97,6 +96,9 @@ let pollInFlight = false;
 let pollFailureCount = 0;
 let finalTranscript = "";
 let liveTranscript = "";
+let streamTextToTarget = false;
+let pastedTranscript = "";
+let targetWriteQueue: Promise<void> = Promise.resolve();
 let lastTranscript = localStorage.getItem("ow_last_transcript") ?? "";
 let mediaRecorder: MediaRecorder | null = null;
 let pcmAudioContext: AudioContext | null = null;
@@ -114,6 +116,7 @@ let capturedPcmBytes = 0;
 let pendingAudioParts: Uint8Array[] = [];
 let pendingAudioBytes = 0;
 let sessionFailure = "";
+let shouldPasteFinalTranscript = true;
 let pressToTalkHeld = false;
 let pressToTalkStarting = false;
 let toggleRecordingStarting = false;
@@ -148,11 +151,6 @@ const AUDIO_BATCH_BYTES = 16 * 1024;
 const app = document.getElementById("app")!;
 app.innerHTML = `
   <div id="widget-shell">
-    <div id="transcript-preview" class="transcript-preview" role="status" aria-live="polite" hidden>
-      <div id="transcript-preview-status" class="transcript-preview-status"></div>
-      <div id="transcript-preview-text" class="transcript-preview-text"></div>
-      <div id="transcript-preview-detail" class="transcript-preview-detail" hidden></div>
-    </div>
     <div id="api-key-bubble" class="api-key-bubble hidden" role="button" tabindex="0" aria-label="Add your OpenAI API key in settings">
       <span class="api-key-bubble-logo" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none">
@@ -350,14 +348,7 @@ const menuImportAudio = document.getElementById("menu-import-audio") as HTMLButt
 const menuOpenRecordings = document.getElementById("menu-open-recordings") as HTMLButtonElement;
 const audioFileInput = document.getElementById("audio-file-input") as HTMLInputElement;
 const recentRecordings = document.getElementById("recent-recordings")!;
-const transcriptPreviewRoot = document.getElementById("transcript-preview")!;
-const transcriptPreview = createTranscriptPreview({
-  root: transcriptPreviewRoot,
-  transcript: document.getElementById("transcript-preview-text")!,
-  status: document.getElementById("transcript-preview-status")!,
-  detail: document.getElementById("transcript-preview-detail")!,
-}, { onVisibilityChange: () => { void applyOverlayLayout(); } });
-let currentTranscriptPreviewAttempt = 0;
+let pasteAccessRequested = false;
 
 let hasOpenaiApiKey = false;
 let transcriptionModel: TranscriptionModel = DEFAULT_TRANSCRIPTION_MODEL;
@@ -440,7 +431,7 @@ function getWindowLayout() {
     menuWidth: menuRect?.width,
     menuHeight: menuRect?.height,
   });
-  return withTranscriptPreviewLayout({
+  return {
     ...layout,
     visible: isRecordingWindowVisible({
       showIdlePill,
@@ -449,8 +440,7 @@ function getWindowLayout() {
       manuallyRevealed: manualOverlayReveal,
       starting: recordingStartupVisible,
     }),
-  }, transcriptPreview.visible, transcriptPreviewRoot.getBoundingClientRect().height,
-  EXPANDED_HEIGHT + 12 + WINDOW_BOTTOM_PADDING);
+  };
 }
 
 async function applyOverlayLayout(force = false) {
@@ -1118,7 +1108,6 @@ async function startRecording() {
     `startRecording enter state=${state} held=${pressToTalkHeld} starting=${pressToTalkStarting}`,
   );
   if (state !== "idle") return;
-  currentTranscriptPreviewAttempt = transcriptPreview.dismiss();
   const cancellation = new AbortController();
   currentRecordingCancellation = cancellation;
   recordingCancellationCleanup = null;
@@ -1138,6 +1127,7 @@ async function startRecording() {
   currentRecordingId = null;
   sessionFailure = "";
   pollFailureCount = 0;
+  shouldPasteFinalTranscript = true;
   let settleCapture!: () => void;
   const captureSettled = new Promise<void>((resolve) => { settleCapture = resolve; });
   const discardedBackups = new Set<string>();
@@ -1160,6 +1150,9 @@ async function startRecording() {
   };
 
   try {
+    logStartupStage("paste target begin");
+    await cancellableRecordingStep(signal, () => waitForStartupStep("Capturing paste target", () => invoke("capture_paste_target")));
+    logStartupStage("paste target complete");
     const settings = await cancellableRecordingStep(signal, () => waitForStartupStep("Loading recording settings", () => invoke<AppSettings>("app_get_settings")));
     logStartupStage("settings ready");
     if (needsApiKey(settings.transcriptionModel, settings.hasOpenaiApiKey)) {
@@ -1246,6 +1239,9 @@ async function startRecording() {
     audioQueue.attachSession(currentSessionId);
     finalTranscript = "";
     liveTranscript = "";
+    streamTextToTarget = getModelCapabilities(settings.transcriptionModel).streamsText;
+    pastedTranscript = "";
+    targetWriteQueue = Promise.resolve();
     startPolling();
     logDebug(`session ready startup_ms=${Math.round(performance.now() - startupStartedAt)}`);
 
@@ -1371,9 +1367,9 @@ async function finishModifierCancelledRecording() {
 async function handlePressToTalkCancel() {
   logDebug(`pressToTalkCancel event state=${state} starting=${pressToTalkStarting}`);
   pressToTalkHeld = false;
-  transcriptPreview.dismiss();
   const cancellation = currentRecordingCancellation;
   if (!cancellation || (state === "idle" && !pressToTalkStarting)) return;
+  shouldPasteFinalTranscript = false;
   cancellation.abort();
   stopPolling();
   stopRecordingVisualizer();
@@ -1390,7 +1386,6 @@ async function handlePressToTalkCancel() {
 }
 
 async function cancelTranscription() {
-  transcriptPreview.dismiss();
   if (currentRecordingCancellation?.signal.aborted) return;
   const sessionId = currentSessionId;
   if (sessionId) {
@@ -1467,14 +1462,16 @@ async function transcribeStoredAudio(
   mimeType: string,
   profileId: string,
 ) {
-  currentTranscriptPreviewAttempt = transcriptPreview.dismiss();
   currentRecordingCancellation = null;
   currentRecordingId = recordingId;
   lastFailedRecordingId = null;
   sessionFailure = "";
   pollFailureCount = 0;
+  shouldPasteFinalTranscript = false;
   finalTranscript = "";
   liveTranscript = "";
+  pastedTranscript = "";
+  targetWriteQueue = Promise.resolve();
   await invoke("recording_finish", {
     recordingId,
     status: "transcribing",
@@ -1533,6 +1530,7 @@ function cleanup() {
   pendingAudioParts = [];
   pendingAudioBytes = 0;
   liveTranscript = "";
+  streamTextToTarget = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,7 +1552,6 @@ async function pollOnce() {
   if (!currentSessionId || pollInFlight) return;
   const signal = currentRecordingCancellation?.signal;
   const sessionId = currentSessionId;
-  const previewAttempt = currentTranscriptPreviewAttempt;
   if (signal?.aborted) return;
   pollInFlight = true;
   try {
@@ -1579,6 +1576,17 @@ async function pollOnce() {
         liveTranscript += ev.text;
         widget.dataset.liveTranscript = liveTranscript;
         widget.setAttribute("aria-label", `Live transcription: ${liveTranscript}`);
+        if (streamTextToTarget) {
+          const delta = ev.text;
+          targetWriteQueue = targetWriteQueue.then(async () => {
+            if (signal?.aborted || currentSessionId !== sessionId) return;
+            const result = await invoke<PasteResult>("paste_to_target", { text: delta });
+            if (signal?.aborted || currentSessionId !== sessionId) return;
+            if (result?.pasted) pastedTranscript += delta;
+          }).catch((err) => {
+            logDebug(`live target write failed=${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
       } else if (ev.type === "error") {
         sessionFailure = ev.text || "Transcription failed";
         await handleTranscriptionFailure(sessionFailure);
@@ -1591,16 +1599,35 @@ async function pollOnce() {
     if (resp.done) {
       stopPolling();
       if (finalTranscript) {
+        await targetWriteQueue;
         if (signal?.aborted || currentSessionId !== sessionId) return;
         lastTranscript = finalTranscript;
         localStorage.setItem("ow_last_transcript", lastTranscript);
         syncWidgetFrame();
-        await invoke<void>("copy_to_clipboard", { text: finalTranscript });
-        const delivery = describeTranscriptDelivery(isMac);
-        if (signal?.aborted || currentSessionId !== sessionId) return;
+        const delivery = await deliverTranscript({
+          copyOnly: !shouldPasteFinalTranscript,
+          isMac,
+          isCurrent: () => !signal?.aborted && currentSessionId === sessionId,
+          paste: () => pastedTranscript
+            ? pastedTranscript.trim() === finalTranscript.trim()
+              ? Promise.resolve({ pasted: true })
+              : invoke<PasteResult>("replace_streamed_target", {
+                  streamedText: pastedTranscript,
+                  finalText: finalTranscript,
+                })
+            : invoke<PasteResult>("paste_to_target", { text: finalTranscript }),
+          copy: () => invoke<void>("copy_to_clipboard", { text: finalTranscript }),
+        });
+        if (!delivery || signal?.aborted || currentSessionId !== sessionId) return;
         await finishCurrentRecording("complete", finalTranscript, "");
         if (signal?.aborted || currentSessionId !== sessionId) return;
-        transcriptPreview.show(finalTranscript, delivery, previewAttempt);
+        if (delivery.notice) showToast(delivery.notice, 6000);
+        if (delivery.needsPasteAccess && !pasteAccessRequested) {
+          pasteAccessRequested = true;
+          void invoke<boolean>("request_paste_access").catch((error) => {
+            logDebug(`paste access request failed=${errorMessage(error)}`);
+          });
+        }
       } else if (sessionFailure) {
         await finishCurrentRecording("failed", "", sessionFailure);
         if (signal?.aborted || currentSessionId !== sessionId) return;
@@ -1624,6 +1651,42 @@ async function pollOnce() {
   } finally {
     pollInFlight = false;
   }
+}
+
+// Native end-to-end smoke hook for development builds. This deliberately uses
+// the same Tauri commands, polling loop, and target-field streaming as a
+// microphone recording; only the PCM source is deterministic test audio.
+if (import.meta.env.DEV) {
+  (window as typeof window & {
+    __openwhisperRealtimeSmoke?: (chunks: string[], intervalMs?: number) => Promise<void>;
+  }).__openwhisperRealtimeSmoke = async (chunks, intervalMs = 100) => {
+    if (state !== "idle") throw new Error(`Cannot start smoke test while state=${state}`);
+    currentRecordingCancellation = null;
+    await invoke("capture_paste_target");
+    const result = await invoke<{ session_id: string }>("worker_start_session", {
+      profileId: "realtime-smoke",
+    });
+    currentSessionId = result.session_id;
+    finalTranscript = "";
+    liveTranscript = "";
+    streamTextToTarget = true;
+    pastedTranscript = "";
+    targetWriteQueue = Promise.resolve();
+    setState("recording");
+    startPolling();
+    for (const chunkBase64 of chunks) {
+      await invoke("worker_append_audio_chunk", {
+        sessionId: currentSessionId,
+        chunkBase64,
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+    }
+    setState("transcribing");
+    await invoke("worker_finalize_session_audio", {
+      sessionId: currentSessionId,
+      mimeType: "audio/pcm;rate=24000",
+    });
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -1107,52 +1107,6 @@ body {
 }
 
 /* ===== Toast ===== */
-.transcript-preview {
-  position: absolute;
-  left: 50%;
-  bottom: calc(26px + var(--window-bottom-padding) + 12px);
-  width: 320px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-solid);
-  transform: translateX(-50%);
-  z-index: 20;
-}
-
-.transcript-preview[hidden],
-.transcript-preview-detail[hidden] {
-  display: none;
-}
-
-.transcript-preview-status {
-  color: var(--accent-strong);
-  font-size: 11px;
-  line-height: 16px;
-}
-
-.transcript-preview-text {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 5;
-  max-height: 90px;
-  margin-top: 6px;
-  overflow: hidden;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-size: 13px;
-  line-height: 18px;
-  user-select: text;
-  -webkit-user-select: text;
-}
-
-.transcript-preview-detail {
-  margin-top: 6px;
-  color: var(--text-muted);
-  font-size: 11px;
-  line-height: 16px;
-}
-
 .toast {
   position: fixed;
   left: 50%;

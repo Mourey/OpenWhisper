@@ -41,6 +41,20 @@ impl Controller {
         self.event_with_repeat(event_type, key, flags, false)
     }
 
+    fn event_from_source(
+        &mut self,
+        event_type: u32,
+        key: u16,
+        flags: u64,
+        repeat: bool,
+        source_tag: i64,
+    ) -> Option<Action> {
+        if source_tag == super::macos_text_inserter::SYNTHETIC_PASTE_EVENT_TAG {
+            return None;
+        }
+        self.event_with_repeat(event_type, key, flags, repeat)
+    }
+
     fn event_with_repeat(
         &mut self,
         event_type: u32,
@@ -320,7 +334,13 @@ unsafe extern "C" fn event_callback(
                 if fresh_press {
                     state.controller.sync_keys_down(physical_keys_down());
                 }
-                let action = state.controller.event_with_repeat(event_type, key, flags, repeat);
+                let action = state.controller.event_from_source(
+                    event_type,
+                    key,
+                    flags,
+                    repeat,
+                    CGEventGetIntegerValueField(event, 42),
+                );
                 if fresh_press && action.is_none() {
                     super::debug_log_line(
                         "shortcut",
@@ -416,6 +436,29 @@ mod tests {
             Some(Action::Stop)
         );
         assert_eq!(controller.event(12, RIGHT_CONTROL_KEY, 0), None);
+    }
+
+    #[test]
+    fn synthetic_paste_does_not_cancel_or_block_the_next_hold() {
+        let mut controller = Controller::default();
+        assert_eq!(down(&mut controller), Some(Action::Start));
+        for event_type in [10, 11] {
+            assert_eq!(
+                controller.event_from_source(
+                    event_type,
+                    9,
+                    1 << 20,
+                    false,
+                    super::super::macos_text_inserter::SYNTHETIC_PASTE_EVENT_TAG,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            controller.event(12, RIGHT_CONTROL_KEY, 0),
+            Some(Action::Stop)
+        );
+        assert_eq!(down(&mut controller), Some(Action::Start));
     }
 
     #[test]
