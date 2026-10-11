@@ -41,20 +41,6 @@ impl Controller {
         self.event_with_repeat(event_type, key, flags, false)
     }
 
-    fn event_from_source(
-        &mut self,
-        event_type: u32,
-        key: u16,
-        flags: u64,
-        repeat: bool,
-        source_tag: i64,
-    ) -> Option<Action> {
-        if source_tag == super::macos_text_inserter::SYNTHETIC_PASTE_EVENT_TAG {
-            return None;
-        }
-        self.event_with_repeat(event_type, key, flags, repeat)
-    }
-
     fn event_with_repeat(
         &mut self,
         event_type: u32,
@@ -109,6 +95,18 @@ impl Controller {
         let action = matches!(self.phase, Phase::Recording).then_some(Action::Cancel);
         *self = Self::default();
         action
+    }
+
+    /// The tap can miss a key-up (secure input fields, app switchers, a tap that
+    /// was disabled mid-press). A leaked count would classify every later Right
+    /// Control press as a chord and leave the shortcut dead until relaunch, so
+    /// each fresh press trusts the hardware state over the running count.
+    fn sync_keys_down(&mut self, physical: usize) {
+        self.other_keys_down = physical;
+    }
+
+    fn is_fresh_press(&self, event_type: u32, key: u16, flags: u64) -> bool {
+        event_type == 12 && key == RIGHT_CONTROL_KEY && flags & RIGHT_CONTROL != 0 && !self.right_down
     }
 }
 
@@ -317,13 +315,17 @@ unsafe extern "C" fn event_callback(
                     0
                 };
                 let repeat = event_type == 10 && CGEventGetIntegerValueField(event, 8) != 0;
-                let action = state.controller.event_from_source(
-                    event_type,
-                    key,
-                    CGEventGetFlags(event),
-                    repeat,
-                    CGEventGetIntegerValueField(event, 42),
-                );
+                let flags = CGEventGetFlags(event);
+                let fresh_press = state.controller.is_fresh_press(event_type, key, flags);
+                if fresh_press {
+                    state.controller.sync_keys_down(physical_keys_down());
+                }
+                let action = state.controller.event_with_repeat(event_type, key, flags, repeat);
+                if fresh_press && action.is_none() {
+                    eprintln!(
+                        "[openwhisper][shortcut] Right Control press ignored: another key or modifier is down"
+                    );
+                }
                 state.action(action);
             }
         }
@@ -353,6 +355,17 @@ extern "C" {
     fn CGEventTapEnable(tap: *mut c_void, enabled: bool);
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
     fn CGEventGetFlags(event: *mut c_void) -> u64;
+    fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+}
+
+const HID_SYSTEM_STATE: i32 = 1;
+const MODIFIER_KEYCODES: std::ops::RangeInclusive<u16> = 54..=63;
+
+fn physical_keys_down() -> usize {
+    (0u16..128)
+        .filter(|key| !MODIFIER_KEYCODES.contains(key))
+        .filter(|key| unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, *key) })
+        .count()
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -405,26 +418,22 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_paste_does_not_cancel_or_block_the_next_hold() {
+    fn lost_key_up_does_not_block_the_shortcut_forever() {
         let mut controller = Controller::default();
+        assert_eq!(controller.event(10, 8, 0), None);
+        assert_eq!(down(&mut controller), None);
+        assert_eq!(controller.event(12, RIGHT_CONTROL_KEY, 0), None);
+        assert!(controller.is_fresh_press(12, RIGHT_CONTROL_KEY, RIGHT_CONTROL));
+        controller.sync_keys_down(0);
         assert_eq!(down(&mut controller), Some(Action::Start));
-        for event_type in [10, 11] {
-            assert_eq!(
-                controller.event_from_source(
-                    event_type,
-                    9,
-                    1 << 20,
-                    false,
-                    super::super::macos_text_inserter::SYNTHETIC_PASTE_EVENT_TAG,
-                ),
-                None
-            );
-        }
-        assert_eq!(
-            controller.event(12, RIGHT_CONTROL_KEY, 0),
-            Some(Action::Stop)
-        );
-        assert_eq!(down(&mut controller), Some(Action::Start));
+    }
+
+    #[test]
+    fn a_key_really_held_still_blocks_the_press() {
+        let mut controller = Controller::default();
+        controller.sync_keys_down(1);
+        assert_eq!(down(&mut controller), None);
+        assert_eq!(controller.event(12, RIGHT_CONTROL_KEY, 0), None);
     }
 
     #[test]

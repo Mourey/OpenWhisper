@@ -5,6 +5,7 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -30,6 +31,43 @@ struct WorkerResponse {
 struct WorkerError {
     code: String,
     message: String,
+}
+
+/// Everything except finalizing is a quick bookkeeping call.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Finalizing runs the whole transcription inside one request. The worker caps
+/// decoding at 3 minutes and transcription at 10, so this only fires when the
+/// worker itself is wedged.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+fn request_timeout(method: &str) -> Duration {
+    if method == "finalize_session_audio" {
+        FINALIZE_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
+#[derive(Debug)]
+pub enum RequestError {
+    /// The worker answered with an error; the connection is still healthy.
+    Worker(String),
+    /// The worker timed out, died or desynchronised; the connection cannot be reused.
+    Transport(String),
+}
+
+impl RequestError {
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worker(message) | Self::Transport(message) => f.write_str(message),
+        }
+    }
 }
 
 pub struct WorkerClient {
@@ -194,20 +232,32 @@ impl WorkerClient {
         })
     }
 
-    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, RequestError> {
+        let limit = request_timeout(method);
+        match tokio::time::timeout(limit, self.exchange(method, params)).await {
+            Ok(result) => result,
+            Err(_) => Err(RequestError::Transport(format!(
+                "Worker did not answer {method} within {} seconds",
+                limit.as_secs()
+            ))),
+        }
+    }
+
+    async fn exchange(&mut self, method: &str, params: Value) -> Result<Value, RequestError> {
+        let transport = |error: &dyn std::fmt::Display| RequestError::Transport(error.to_string());
         let req = WorkerRequest {
             id: Uuid::new_v4().to_string(),
             method: method.to_string(),
             params,
         };
 
-        let req_json = serde_json::to_string(&req)?;
-        self.stdin.write_all(req_json.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
+        let req_json = serde_json::to_string(&req).map_err(|e| transport(&e))?;
+        self.stdin.write_all(req_json.as_bytes()).await.map_err(|e| transport(&e))?;
+        self.stdin.write_all(b"\n").await.map_err(|e| transport(&e))?;
+        self.stdin.flush().await.map_err(|e| transport(&e))?;
 
         let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
+        self.stdout.read_line(&mut line).await.map_err(|e| transport(&e))?;
         if line.trim().is_empty() {
             let stderr = self.stderr_buf.lock().await;
             let msg = if stderr.trim().is_empty() {
@@ -215,12 +265,12 @@ impl WorkerClient {
             } else {
                 format!("Worker process exited:\n{}", stderr.trim())
             };
-            return Err(anyhow!("{}", msg));
+            return Err(RequestError::Transport(msg));
         }
 
-        let response: WorkerResponse = serde_json::from_str(&line)?;
+        let response: WorkerResponse = serde_json::from_str(&line).map_err(|e| transport(&e))?;
         if response.id != req.id {
-            return Err(anyhow!("Worker response id mismatch"));
+            return Err(RequestError::Transport("Worker response id mismatch".to_string()));
         }
 
         if response.ok {
@@ -228,8 +278,8 @@ impl WorkerClient {
         } else {
             let err = response
                 .error
-                .ok_or_else(|| anyhow!("Unknown worker error"))?;
-            Err(anyhow!("{}: {}", err.code, err.message))
+                .ok_or_else(|| RequestError::Worker("Unknown worker error".to_string()))?;
+            Err(RequestError::Worker(format!("{}: {}", err.code, err.message)))
         }
     }
 }
@@ -343,4 +393,29 @@ fn python_candidates(worker_src: &str) -> Vec<String> {
     }
 
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_finalizing_gets_the_long_timeout() {
+        assert_eq!(request_timeout("finalize_session_audio"), FINALIZE_TIMEOUT);
+        for method in ["start_session", "append_audio_chunk", "poll_session_events", "stop_session", "list_models"] {
+            assert_eq!(request_timeout(method), REQUEST_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn finalize_outlives_the_workers_own_transcription_limits() {
+        // decode (3 min) + local transcription (10 min) must finish inside the request limit
+        assert!(FINALIZE_TIMEOUT > Duration::from_secs(3 * 60 + 10 * 60));
+    }
+
+    #[test]
+    fn only_transport_failures_discard_the_worker() {
+        assert!(RequestError::Transport("timed out".into()).is_transport());
+        assert!(!RequestError::Worker("bad_request: Unknown session_id".into()).is_transport());
+    }
 }

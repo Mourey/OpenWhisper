@@ -28,15 +28,11 @@ change keeps the current binding. macOS can allow multiple apps to register the
 same shortcut, so choose the other option if another app responds too.
 
 You can also click the microphone to record. Transcription runs locally when
-recording stops. On macOS, OpenWhisper inserts the finished transcript into the
-focused text field captured when recording began, and shows a four-second
-preview. Enable OpenWhisper under **System Settings → Privacy & Security →
-Accessibility** to allow insertion. The preview offers **Enable Accessibility**
-when permission is missing. It never restores focus to another app: if you move
-to another field or hold another modifier, the transcript stays on the clipboard
-and the preview says to use **Command+V**. Imported recordings are copy-only.
-Windows uses Ctrl+Space and automatic insertion into another app. If the pill is
-hidden, use the menu bar icon's **Show Pill** action.
+recording stops. OpenWhisper never types into other apps: the finished
+transcript is copied to the clipboard and shown in a four-second preview, and
+you paste it where you want with **Command+V**. No Accessibility access is
+needed. Imported recordings are copy-only too. Windows uses Ctrl+Space. If the
+pill is hidden, use the menu bar icon's **Show Pill** action.
 
 Turn off **Show pill when idle** in Appearance to keep the orb hidden between
 recordings. It becomes visible during recording startup, recording, and
@@ -116,8 +112,12 @@ Relaunch OpenWhisper, enable it in Privacy & Security > Input Monitoring, and
 choose Quit & Reopen when prompted. Hold Right Control to start recording and
 allow microphone access when requested. Confirm an enabled Core Graphics event
 tap for the running app rather than relying on the Settings switch alone.
-Grant Accessibility again for insertion if its previous permission record was
-also rejected after rebuilding.
+
+If Right Control stops responding, the app's diagnostic log is
+`~/Library/Logs/OpenWhisper/debug.log` (rotated at 2 MB). Look for
+`Right Control press ignored` (a key or modifier was reported down),
+`discarding worker after transport failure` (the transcription worker timed out
+or died and was restarted), and `Right Control keyboard listener ready`.
 
 The packaging settings follow Tauri's [macOS app bundle documentation](https://v2.tauri.app/distribute/macos-application-bundle/)
 and [transparent window configuration](https://v2.tauri.app/reference/config/#transparent).

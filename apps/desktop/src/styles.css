@@ -1121,8 +1121,7 @@ body {
 }
 
 .transcript-preview[hidden],
-.transcript-preview-detail[hidden],
-.transcript-preview-paste-access[hidden] {
+.transcript-preview-detail[hidden] {
   display: none;
 }
 
@@ -1152,18 +1151,6 @@ body {
   color: var(--text-muted);
   font-size: 11px;
   line-height: 16px;
-}
-
-.transcript-preview-paste-access {
-  margin-top: 8px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface-soft);
-  color: var(--text);
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
 }
 
 .toast {
