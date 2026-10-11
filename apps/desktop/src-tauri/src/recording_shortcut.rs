@@ -182,9 +182,9 @@ pub(crate) fn install(app: &AppHandle, settings: &mut AppSettings) -> Result<(),
             runtime.error = runtime.monitor.as_ref().and_then(Monitor::error);
             settings.recording_shortcut = active.setting().to_string();
             if let Some(error) = &runtime.error {
-                eprintln!("[openwhisper][shortcut] {error}");
+                super::debug_log_line("shortcut", &error.to_string());
             } else {
-                eprintln!("[openwhisper][shortcut] registered {}", active.label());
+                super::debug_log_line("shortcut", &format!("registered {}", active.label()));
             }
         }
         Err(error) => runtime.error = Some(error),

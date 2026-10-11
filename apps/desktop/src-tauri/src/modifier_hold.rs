@@ -200,7 +200,7 @@ fn update_error(app: &AppHandle, error: &Mutex<Option<String>>, next: Option<Str
         *current = next.clone();
     }
     if let Some(message) = &next {
-        eprintln!("[openwhisper][shortcut] {message}");
+        super::debug_log_line("shortcut", message);
     }
     super::recording_shortcut::modifier_status(app, next);
 }
@@ -261,7 +261,7 @@ fn run_monitor(
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
             CGEventTapEnable(state.tap, true);
         }
-        eprintln!("[openwhisper][shortcut] Right Control keyboard listener ready");
+        super::debug_log_line("shortcut", "Right Control keyboard listener ready");
         update_error(&state.app, &error, None);
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
@@ -322,8 +322,9 @@ unsafe extern "C" fn event_callback(
                 }
                 let action = state.controller.event_with_repeat(event_type, key, flags, repeat);
                 if fresh_press && action.is_none() {
-                    eprintln!(
-                        "[openwhisper][shortcut] Right Control press ignored: another key or modifier is down"
+                    super::debug_log_line(
+                        "shortcut",
+                        "Right Control press ignored: another key or modifier is down",
                     );
                 }
                 state.action(action);
