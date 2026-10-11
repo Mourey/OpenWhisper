@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from openwhisper_worker.local_client import LOCAL_MODELS, OpenWhisperLocal
 from openwhisper_worker.openai_client import OpenWhisperOpenAI, RealtimeTranscriptionStream
 from openwhisper_worker.protocol import WorkerError, WorkerRequest, WorkerResponse
 
@@ -34,7 +35,8 @@ _REALTIME_ROTATE_BYTES = 24_000 * 2 * 25 * 60
 
 class WorkerServer:
     def __init__(self) -> None:
-        self._openai = OpenWhisperOpenAI()
+        model = os.getenv("OPENWHISPER_MODEL", "gpt-4o-mini-transcribe").strip()
+        self._openai = OpenWhisperLocal() if model in LOCAL_MODELS else OpenWhisperOpenAI()
         self._sessions: dict[str, Session] = {}
 
     def handle(self, request: WorkerRequest) -> WorkerResponse:
@@ -60,7 +62,9 @@ class WorkerServer:
     def _handle_start_session(self, request: WorkerRequest) -> WorkerResponse:
         profile_id = str(request.params.get("profile_id", "default"))
         prompt = str(request.params.get("prompt", ""))
-        refine_enabled = bool(request.params.get("refine_enabled", True))
+        refine_enabled = self._openai.model not in LOCAL_MODELS and bool(
+            request.params.get("refine_enabled", True)
+        )
         refine_prompt = str(request.params.get("refine_prompt", ""))
         sys.stderr.write(
             "[worker] start_session "
@@ -308,4 +312,3 @@ def run_stdio_server() -> None:
         payload = res.model_dump_json()
         sys.stdout.write(payload + "\n")
         sys.stdout.flush()
-

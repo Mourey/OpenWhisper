@@ -10,6 +10,47 @@ export async function captureBeforeSession<Capture, Session>(steps: {
   return steps.startSession();
 }
 
+export async function prepareRecordingCapture<Microphone, Backup, Capture, Session>(steps: {
+  acquireMicrophone: () => Promise<Microphone>;
+  createBackup: () => Promise<Backup>;
+  onBackupReady: (backup: Backup) => void;
+  startCapture: (microphone: Microphone) => Promise<Capture>;
+  onCaptureStarted: (capture: Capture) => void | Promise<void>;
+  startSession: () => Promise<Session>;
+  discardBackup?: (backup: Backup) => void;
+}): Promise<Session> {
+  const backupResult = steps.createBackup().then(
+    (backup) => ({ backup }),
+    (error: unknown) => ({ error }),
+  );
+  let backupAttached = false;
+  try {
+    const microphone = await steps.acquireMicrophone();
+    const capture = await steps.startCapture(microphone);
+    await steps.onCaptureStarted(capture);
+    const result = await backupResult;
+    if ("error" in result) throw result.error;
+    steps.onBackupReady(result.backup);
+    backupAttached = true;
+    return await steps.startSession();
+  } finally {
+    if (!backupAttached) {
+      void backupResult.then((result) => {
+        if ("backup" in result) steps.discardBackup?.(result.backup);
+      });
+    }
+  }
+}
+
+export function shouldCancelEmptyHold(input: {
+  starting: boolean;
+  state: "idle" | "recording" | "transcribing" | "error";
+  capturedBytes: number;
+}) {
+  return (input.starting && input.state === "idle") ||
+    (input.state === "recording" && input.capturedBytes === 0);
+}
+
 /**
  * Keeps audio captured before a worker session exists, then uploads every chunk
  * serially. Serial uploads make the byte order independent of IPC latency.

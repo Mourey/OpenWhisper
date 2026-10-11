@@ -1,11 +1,21 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { TRANSCRIPTION_MODELS } from "./transcription-model";
 
 const desktopRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(desktopRoot, "../..");
 
 describe("desktop regression contracts", () => {
+  it("offers the supported transcription models including local Large v3 Turbo", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const menu = main.match(/<select id="menu-model-select"[^>]*>([\s\S]*?)<\/select>/)?.[1];
+    expect(menu).toBeDefined();
+    const models = Array.from(menu!.matchAll(/<option value="([^"]+)"/g), (match) => match[1]);
+    expect(models).toEqual([...TRANSCRIPTION_MODELS]);
+    expect(menu).toContain('<option value="whisper-turbo-local">Local — Whisper Large v3 Turbo</option>');
+  });
+
   it("keeps custom Cargo targets out of Tauri's watched source tree", () => {
     const gitignore = readFileSync(resolve(repositoryRoot, ".gitignore"), "utf8");
     const runLocal = readFileSync(resolve(repositoryRoot, "scripts/run-local.ps1"), "utf8");
@@ -36,21 +46,109 @@ describe("desktop regression contracts", () => {
     expect(main).toContain("Show pill when idle");
     expect(main.indexOf("Show pill when idle")).toBeLessThan(main.indexOf("Microphone</div>"));
     expect(main).toContain('aria-label="Show pill when idle"');
-    expect(main).toContain('visible: showIdlePill || state !== "idle" || menuOpen || manualOverlayReveal');
+    expect(main).toContain('visible: isRecordingWindowVisible({');
+    expect(main).toContain('starting: recordingStartupVisible');
+    expect(main).toContain('manuallyRevealed: manualOverlayReveal');
     expect(native).toContain("window.hide().map_err");
     expect(native).toContain('MenuItem::with_id(app, "show", "Show Pill"');
+  });
+
+  it("reveals a hidden recording window before microphone acquisition without requesting permission at startup", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const refresh = main.match(/async function refreshMicDevices\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const start = main.match(/async function startRecording\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const focusLoss = main.match(/void listen\("overlay-lost-focus", \(\) => \{([\s\S]*?)\n\}\);/)?.[1];
+
+    expect(refresh).toContain("enumerateDevices()");
+    expect(refresh).not.toContain("getUserMedia");
+    expect(start).toBeDefined();
+    expect(start!.indexOf('invoke("capture_paste_target")')).toBeLessThan(start!.indexOf("recordingStartupVisible = true"));
+    expect(start).toContain("revealWindow: () => applyOverlayLayout(true)");
+    expect(start).toContain("return navigator.mediaDevices.getUserMedia(constraints)");
+    expect(start).toContain("discard: (stream) => stream.getTracks().forEach((track) => track.stop())");
+    expect(start).toContain("finally {\n    recordingStartupVisible = false;");
+    expect(focusLoss).toContain("manualOverlayReveal = false");
+    expect(focusLoss).not.toContain("recordingStartupVisible");
   });
 
   it("offers hold-to-talk and press-to-toggle shortcut modes", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const native = readFileSync(resolve(desktopRoot, "src-tauri/src/lib.rs"), "utf8");
 
-    expect(main).toContain("Hold Ctrl+Space to talk");
-    expect(main).toContain("press Ctrl+Space once to start listening and again to finish");
+    expect(main).toContain("Hold ${defaultShortcutLabel} to talk");
+    expect(main).toContain("press ${defaultShortcutLabel} once to start listening and again to finish");
+    expect(main).toContain('menuHoldToTalkToggle.setAttribute("aria-label", `Hold ${label} to talk`)');
     expect(main).toContain("holdToTalk: menuHoldToTalkToggle.checked");
     expect(native).toContain("HOLD_TO_TALK_ENABLED");
     expect(native).toContain("TOGGLE_RECORDING.store(true");
     expect(native).toContain('emit("toggle-recording", ())');
+  });
+
+  it("persists Mac shortcut choices and restores the active shortcut on registration errors", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+
+    expect(main).toContain('aria-label="Recording shortcut"');
+    expect(main).toContain('getRecordingShortcutChoices(isMac)');
+    expect(main).toContain('recordingShortcut: shortcut,');
+    expect(main).toContain('...(shortcut === "RightControl" ? { holdToTalk: true } : {})');
+    expect(main).toContain('recordingShortcut = result.recordingShortcut');
+    expect(main).toContain('syncRecordingShortcutUi(result.error)');
+    expect(main).toContain('syncRecordingShortcutUi(settings.recordingShortcutError ?? null)');
+    expect(main).not.toContain("Hold Ctrl+Space to talk");
+  });
+
+  it("keeps optional recording feedback failures from aborting transcription startup", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const feedback = main.match(/function startRecordingFeedback\(stream: MediaStream\) \{([\s\S]*?)\n\}/)?.[1];
+    const capture = main.match(/onCaptureStarted: async \(stream\) => \{([\s\S]*?)\n      \},/)?.[1];
+
+    expect(feedback).toContain('logStartupStage("visualizer create begin")');
+    expect(feedback).toContain('logStartupStage("visualizer create complete")');
+    expect(feedback).toContain('logStartupStage("visualizer start begin")');
+    expect(feedback).toContain('logStartupStage("visualizer start complete")');
+    expect(feedback).toContain('logStartupStage("volume monitor begin")');
+    expect(feedback).toContain('logStartupStage("volume monitor complete")');
+    expect(feedback).toContain('optional recording visualizer failed=');
+    expect(feedback).toContain('optional recording volume monitor failed=');
+    expect(feedback).not.toContain("throw");
+    expect(capture).toContain("startRecordingFeedback(stream)");
+    expect(capture).toContain("await stopRecording()");
+  });
+
+  it("cancels modifier chords without writing transcripts or showing no-speech errors", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const cancel = main.match(/async function handlePressToTalkCancel\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const poll = main.match(/async function pollOnce\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const failure = main.match(/async function handleTranscriptionFailure\(error: unknown\) \{([\s\S]*?)\n\}/)?.[1];
+
+    expect(main).toContain('void listen("press-to-talk-cancel"');
+    expect(main).toContain('void listen("recording-shortcut-status-changed"');
+    expect(cancel).toContain("pressToTalkHeld = false");
+    expect(cancel).toContain("shouldPasteFinalTranscript = false");
+    expect(cancel).toContain("cancellation.abort()");
+    expect(cancel).toContain("await stopPcmCapture()");
+    expect(cancel).not.toContain("finalizeRecording");
+    expect(poll).toContain("if (signal?.aborted || currentSessionId !== sessionId) return");
+    expect(failure).toContain("if (signal?.aborted) return");
+    expect(main).toContain('status: "cancelled"');
+    expect(main).not.toContain('shortcut === "LeftCommand"');
+  });
+
+  it("keeps pending modifier cancellation from starting or cleaning up another recording", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const toggle = main.match(/async function toggleRecording\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const cleanup = main.match(/async function finishModifierCancelledRecording\(\) \{([\s\S]*?)\n\}/)?.[1];
+    const poll = main.match(/async function pollOnce\(\) \{([\s\S]*?)\n\}/)?.[1];
+
+    expect(toggle).toContain("if (pressToTalkStarting) return");
+    expect(cleanup).toContain("if (recordingCancellationCleanup) return recordingCancellationCleanup");
+    expect(cleanup).toContain("const sessionId = currentSessionId");
+    expect(cleanup).toContain("const recordingId = recordingAttemptBackupId ?? currentRecordingId");
+    expect(cleanup).toContain("if (currentRecordingCancellation !== cancellation) return");
+    expect(cleanup).not.toContain("recordingCancellationCleanup = null");
+    expect(poll).toMatch(/await finishCurrentRecording\("complete", finalTranscript, ""\);\n\s+if \(signal\?\.aborted \|\| currentSessionId !== sessionId\) return;/);
+    expect(poll).toContain("isCurrent: () => !signal?.aborted && currentSessionId === sessionId");
+    expect(poll).toContain('copy: () => invoke<void>("copy_to_clipboard", { text: finalTranscript })');
   });
 
   it("refreshes the stable local installer after every Windows build", () => {
@@ -121,8 +219,8 @@ describe("desktop regression contracts", () => {
     const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
 
     expect(main).not.toContain('id="live-transcript"');
-    expect(main).toContain('invoke("paste_to_target", { text: delta })');
-    expect(main).toContain('invoke("replace_streamed_target"');
+    expect(main).toContain('invoke<PasteResult>("paste_to_target", { text: delta })');
+    expect(main).toContain('invoke<PasteResult>("replace_streamed_target"');
     expect(main).toContain("import.meta.env.DEV");
     expect(main).toContain("__openwhisperRealtimeSmoke");
     expect(css).not.toMatch(/\.live-transcript\s*\{/);
@@ -163,6 +261,7 @@ describe("desktop regression contracts", () => {
   it("renders one accessible transcript surface for both preview and full text", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+    const recordingHistory = main.match(/async function refreshRecordings\(\) \{([\s\S]*?)\n\}/)?.[1];
 
     // Single text surface — the same element is clamped when collapsed and
     // revealed when expanded, never duplicated into a second block.
@@ -170,7 +269,7 @@ describe("desktop regression contracts", () => {
     expect(main).toContain("transcriptText.id = `recording-transcript-${recording.id}`");
     expect(main).toContain('transcriptText.textContent = transcript');
     expect(main).not.toContain("recording-transcript-body");
-    expect(main).not.toContain("transcriptPreview");
+    expect(recordingHistory).not.toContain("transcriptPreview");
 
     // Disclosure control drives expansion via aria-expanded/aria-controls and
     // is a sibling of the copy button (no button nested inside a button).

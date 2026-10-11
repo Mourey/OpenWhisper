@@ -1,3 +1,9 @@
+#[cfg(target_os = "macos")]
+mod macos_text_inserter;
+#[cfg(target_os = "macos")]
+mod modifier_hold;
+#[cfg(target_os = "macos")]
+mod recording_shortcut;
 mod worker_client;
 
 use anyhow::{anyhow, Result};
@@ -691,18 +697,31 @@ fn default_transcription_prompt() -> String {
 }
 
 fn default_transcription_model() -> String {
-    "gpt-4o-mini-transcribe".to_string()
+    "whisper-base-local".to_string()
 }
 
 fn is_supported_transcription_model(model: &str) -> bool {
     matches!(
         model,
-        "gpt-4o-mini-transcribe" | "gpt-4o-transcribe" | "gpt-realtime-transcribe"
+        "whisper-base-local"
+            | "whisper-tiny-local"
+            | "whisper-turbo-local"
+            | "gpt-4o-mini-transcribe"
+            | "gpt-4o-transcribe"
+            | "gpt-realtime-transcribe"
     )
 }
 
+fn refinement_enabled_for_model(model: &str, requested: bool) -> bool {
+    requested
+        && !matches!(
+            model,
+            "whisper-base-local" | "whisper-tiny-local" | "whisper-turbo-local"
+        )
+}
+
 fn default_refine_enabled() -> bool {
-    true
+    false
 }
 
 fn default_show_idle_pill() -> bool {
@@ -711,6 +730,18 @@ fn default_show_idle_pill() -> bool {
 
 fn default_hold_to_talk() -> bool {
     true
+}
+
+fn default_recording_shortcut() -> String {
+    if cfg!(target_os = "macos") {
+        "Control+Alt+Space".to_string()
+    } else {
+        "Control+Space".to_string()
+    }
+}
+
+fn hold_to_talk_for_shortcut(shortcut: &str, requested: bool) -> bool {
+    requested || (cfg!(target_os = "macos") && shortcut == "RightControl")
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -730,6 +761,8 @@ struct AppSettings {
     show_idle_pill: bool,
     #[serde(default = "default_hold_to_talk")]
     hold_to_talk: bool,
+    #[serde(default = "default_recording_shortcut")]
+    recording_shortcut: String,
 }
 
 impl Default for AppSettings {
@@ -738,10 +771,11 @@ impl Default for AppSettings {
             openai_api_key: String::new(),
             transcription_model: default_transcription_model(),
             transcription_prompt: default_transcription_prompt(),
-            refine_enabled: true,
+            refine_enabled: default_refine_enabled(),
             refine_prompt: String::new(),
             show_idle_pill: true,
             hold_to_talk: true,
+            recording_shortcut: default_recording_shortcut(),
         }
     }
 }
@@ -757,6 +791,8 @@ struct FrontendSettings {
     refine_prompt: String,
     show_idle_pill: bool,
     hold_to_talk: bool,
+    recording_shortcut: String,
+    recording_shortcut_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -824,6 +860,9 @@ impl MonitorTransitionDebouncer {
 struct AppState {
     worker: Mutex<Option<WorkerClient>>,
     settings: std::sync::Mutex<AppSettings>,
+    settings_update: Mutex<()>,
+    #[cfg(target_os = "macos")]
+    recording_shortcut: std::sync::Mutex<recording_shortcut::Runtime>,
     overlay_anchor: std::sync::Mutex<Option<OverlayAnchor>>,
     overlay_layout: std::sync::Mutex<Option<OverlayLayoutSpec>>,
     overlay_layout_locked: AtomicBool,
@@ -1039,11 +1078,39 @@ fn frontend_settings_from(settings: &AppSettings) -> FrontendSettings {
         openai_api_key_preview,
         transcription_model: settings.transcription_model.clone(),
         transcription_prompt: settings.transcription_prompt.clone(),
-        refine_enabled: settings.refine_enabled,
+        refine_enabled: refinement_enabled_for_model(
+            &settings.transcription_model,
+            settings.refine_enabled,
+        ),
         refine_prompt: settings.refine_prompt.clone(),
         show_idle_pill: settings.show_idle_pill,
-        hold_to_talk: settings.hold_to_talk,
+        hold_to_talk: hold_to_talk_for_shortcut(
+            &settings.recording_shortcut,
+            settings.hold_to_talk,
+        ),
+        recording_shortcut: settings.recording_shortcut.clone(),
+        recording_shortcut_error: None,
     }
+}
+
+fn frontend_settings_with_runtime(
+    state: &AppState,
+    settings: &AppSettings,
+) -> Result<FrontendSettings, String> {
+    #[allow(unused_mut)]
+    let mut frontend = frontend_settings_from(settings);
+    #[cfg(target_os = "macos")]
+    {
+        frontend.recording_shortcut_error = state
+            .recording_shortcut
+            .lock()
+            .map_err(|_| "Failed to lock recording shortcut".to_string())?
+            .error
+            .clone();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = state;
+    Ok(frontend)
 }
 
 fn masked_api_key_preview(api_key: &str) -> Option<String> {
@@ -1407,7 +1474,7 @@ async fn app_get_settings(state: State<'_, Arc<AppState>>) -> Result<FrontendSet
         .lock()
         .map_err(|_| "Failed to lock settings".to_string())?
         .clone();
-    Ok(frontend_settings_from(&settings))
+    frontend_settings_with_runtime(&state, &settings)
 }
 
 #[tauri::command]
@@ -1418,6 +1485,14 @@ async fn app_get_openai_api_key(state: State<'_, Arc<AppState>>) -> Result<Strin
         .map_err(|_| "Failed to lock settings".to_string())?
         .clone();
     Ok(settings.openai_api_key)
+}
+
+fn worker_settings_changed(previous: &AppSettings, updated: &AppSettings) -> bool {
+    previous.openai_api_key != updated.openai_api_key
+        || previous.transcription_model != updated.transcription_model
+        || previous.transcription_prompt != updated.transcription_prompt
+        || previous.refine_enabled != updated.refine_enabled
+        || previous.refine_prompt != updated.refine_prompt
 }
 
 #[tauri::command]
@@ -1431,13 +1506,17 @@ async fn app_save_settings(
     refine_prompt: Option<String>,
     show_idle_pill: Option<bool>,
     hold_to_talk: Option<bool>,
+    recording_shortcut: Option<String>,
 ) -> Result<FrontendSettings, String> {
+    let _update = state.settings_update.lock().await;
+    let shortcut_requested = recording_shortcut.is_some();
+    let previous = state
+        .settings
+        .lock()
+        .map_err(|_| "Failed to lock settings".to_string())?
+        .clone();
     let updated = {
-        let mut current = state
-            .settings
-            .lock()
-            .map_err(|_| "Failed to lock settings".to_string())?
-            .clone();
+        let mut current = previous.clone();
         if let Some(key) = openai_api_key {
             current.openai_api_key = key.trim().to_string();
         }
@@ -1462,9 +1541,32 @@ async fn app_save_settings(
         if let Some(enabled) = hold_to_talk {
             current.hold_to_talk = enabled;
         }
+        if let Some(shortcut) = recording_shortcut {
+            #[cfg(target_os = "macos")]
+            recording_shortcut::RecordingShortcut::parse(&shortcut)?;
+            #[cfg(not(target_os = "macos"))]
+            if shortcut != "Control+Space" {
+                return Err("Only Ctrl+Space is supported on this platform.".to_string());
+            }
+            current.recording_shortcut = shortcut;
+        }
+        current.hold_to_talk =
+            hold_to_talk_for_shortcut(&current.recording_shortcut, current.hold_to_talk);
+        current.refine_enabled =
+            refinement_enabled_for_model(&current.transcription_model, current.refine_enabled);
         current
     };
-    save_settings(&app_handle, &updated).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    if shortcut_requested {
+        recording_shortcut::save_with_binding(&app_handle, &state, &previous, &updated)?;
+    } else {
+        save_settings(&app_handle, &updated).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = shortcut_requested;
+        save_settings(&app_handle, &updated).map_err(|e| e.to_string())?;
+    }
 
     {
         let mut settings = state
@@ -1477,11 +1579,16 @@ async fn app_save_settings(
     #[cfg(target_os = "windows")]
     text_inserter::set_hold_to_talk_enabled(updated.hold_to_talk);
 
-    // Force a fresh worker spawn so new settings are applied.
-    let mut worker = state.worker.lock().await;
-    *worker = None;
+    if let Some(tray) = app_handle.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(recording_shortcut_tooltip(&updated)));
+    }
 
-    Ok(frontend_settings_from(&updated))
+    if worker_settings_changed(&previous, &updated) {
+        let mut worker = state.worker.lock().await;
+        *worker = None;
+    }
+
+    frontend_settings_with_runtime(&state, &updated)
 }
 
 #[tauri::command]
@@ -1513,7 +1620,7 @@ async fn worker_start_session(
             .map_err(|_| "Failed to lock settings".to_string())?;
         (
             s.transcription_prompt.clone(),
-            s.refine_enabled,
+            refinement_enabled_for_model(&s.transcription_model, s.refine_enabled),
             s.refine_prompt.clone(),
         )
     };
@@ -1635,15 +1742,58 @@ fn open_api_keys_page(app_handle: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn paste_to_target(text: String) -> Result<(), String> {
+async fn paste_to_target(text: String) -> Result<PasteResult, String> {
     arboard::Clipboard::new()
         .and_then(|mut c| c.set_text(&text))
         .map_err(|e| e.to_string())?;
 
-    #[cfg(target_os = "windows")]
-    text_inserter::restore_and_paste();
+    #[cfg(target_os = "macos")]
+    return Ok(macos_text_inserter::paste_to_captured_target(&text));
 
-    Ok(())
+    #[cfg(target_os = "windows")]
+    {
+        text_inserter::restore_and_paste();
+        Ok(PasteResult {
+            pasted: true,
+            reason: None,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    Ok(PasteResult {
+        pasted: false,
+        reason: Some("unsupported_target"),
+    })
+}
+
+#[cfg(target_os = "macos")]
+type PasteResult = macos_text_inserter::PasteOutcome;
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Serialize)]
+struct PasteResult {
+    pasted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+#[tauri::command]
+async fn request_paste_access(app_handle: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        app_handle
+            .run_on_main_thread(move || {
+                let _ = sender.send(macos_text_inserter::request_access());
+            })
+            .map_err(|error| error.to_string())?;
+        receiver.await.map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_handle;
+        Ok(true)
+    }
 }
 
 #[tauri::command]
@@ -1657,18 +1807,37 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 fn capture_paste_target() {
     #[cfg(target_os = "windows")]
     text_inserter::save_foreground();
+
+    #[cfg(target_os = "macos")]
+    macos_text_inserter::capture_target();
 }
 
 #[tauri::command]
-async fn replace_streamed_target(streamed_text: String, final_text: String) -> Result<(), String> {
+async fn replace_streamed_target(
+    streamed_text: String,
+    final_text: String,
+) -> Result<PasteResult, String> {
     arboard::Clipboard::new()
         .and_then(|mut c| c.set_text(&final_text))
         .map_err(|e| e.to_string())?;
 
     #[cfg(target_os = "windows")]
-    text_inserter::restore_and_replace(streamed_text.chars().count());
+    {
+        text_inserter::restore_and_replace(streamed_text.chars().count());
+        Ok(PasteResult {
+            pasted: true,
+            reason: None,
+        })
+    }
 
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = streamed_text;
+        Ok(PasteResult {
+            pasted: false,
+            reason: Some("unsupported_target"),
+        })
+    }
 }
 
 #[tauri::command]
@@ -1874,6 +2043,19 @@ fn reveal_overlay_window(app: &AppHandle) {
     reveal_window(app, OverlayRevealIntent::Passive);
 }
 
+fn recording_shortcut_tooltip(settings: &AppSettings) -> String {
+    let label = if cfg!(target_os = "macos") {
+        settings
+            .recording_shortcut
+            .replace("Control+Alt+", "Control+Option+")
+            .replace("KeyW", "W")
+            .replace("RightControl", "Right Control")
+    } else {
+        "Ctrl+Space".to_string()
+    };
+    format!("OpenWhisper – {label} to talk")
+}
+
 fn setup_tray(app: &tauri::App) -> Result<()> {
     let show_i = MenuItem::with_id(app, "show", "Show Pill", true, None::<&str>)
         .map_err(|e| anyhow!("{e}"))?;
@@ -1886,9 +2068,15 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
     let menu =
         Menu::with_items(app, &[&show_i, &record_i, &sep, &quit_i]).map_err(|e| anyhow!("{e}"))?;
 
-    TrayIconBuilder::new()
+    let settings = app
+        .state::<Arc<AppState>>()
+        .settings
+        .lock()
+        .map_err(|_| anyhow!("Failed to lock settings for tray"))?
+        .clone();
+    TrayIconBuilder::with_id("main")
         .icon(make_tray_icon())
-        .tooltip("OpenWhisper – Ctrl+Space to talk")
+        .tooltip(recording_shortcut_tooltip(&settings))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1923,6 +2111,9 @@ pub fn run() {
     let app_state = Arc::new(AppState {
         worker: Mutex::new(None),
         settings: std::sync::Mutex::new(AppSettings::default()),
+        settings_update: Mutex::new(()),
+        #[cfg(target_os = "macos")]
+        recording_shortcut: std::sync::Mutex::new(recording_shortcut::Runtime::default()),
         overlay_anchor: std::sync::Mutex::new(None),
         overlay_layout: std::sync::Mutex::new(None),
         overlay_layout_locked: AtomicBool::new(false),
@@ -1957,15 +2148,25 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let loaded = load_settings(app.handle()).unwrap_or_default();
+            #[allow(unused_mut)]
+            let mut loaded = load_settings(app.handle()).unwrap_or_default();
+            #[cfg(target_os = "macos")]
+            if let Err(error) = recording_shortcut::install(app.handle(), &mut loaded) {
+                eprintln!("[openwhisper][shortcut] {error}");
+                app.state::<Arc<AppState>>().recording_shortcut.lock()
+                    .map_err(|_| anyhow!("Failed to lock recording shortcut during setup"))?
+                    .error = Some(error);
+            }
             #[cfg(target_os = "windows")]
             text_inserter::set_hold_to_talk_enabled(loaded.hold_to_talk);
             let state = app.state::<Arc<AppState>>();
-            let mut settings = state
-                .settings
-                .lock()
-                .map_err(|_| anyhow!("Failed to lock settings during setup"))?;
-            *settings = loaded;
+            {
+                let mut settings = state
+                    .settings
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock settings during setup"))?;
+                *settings = loaded;
+            }
 
             if let Err(e) = setup_tray(app) {
                 eprintln!("Failed to create tray icon: {e}");
@@ -2077,6 +2278,7 @@ pub fn run() {
             get_foreground_app,
             open_api_keys_page,
             capture_paste_target,
+            request_paste_access,
             copy_to_clipboard,
             paste_to_target,
             replace_streamed_target,
@@ -2195,10 +2397,54 @@ mod tests {
 
     #[test]
     fn transcription_model_allowlist_matches_settings_ui() {
+        assert!(is_supported_transcription_model("whisper-base-local"));
+        assert!(is_supported_transcription_model("whisper-tiny-local"));
+        assert!(is_supported_transcription_model("whisper-turbo-local"));
         assert!(is_supported_transcription_model("gpt-4o-mini-transcribe"));
         assert!(is_supported_transcription_model("gpt-4o-transcribe"));
         assert!(is_supported_transcription_model("gpt-realtime-transcribe"));
         assert!(!is_supported_transcription_model("gpt-5.4"));
+    }
+
+    #[test]
+    fn new_settings_default_to_local_transcription_without_cloud_refinement() {
+        for settings in [
+            AppSettings::default(),
+            serde_json::from_value(json!({})).unwrap(),
+        ] {
+            assert_eq!(settings.transcription_model, "whisper-base-local");
+            assert!(settings.openai_api_key.is_empty());
+            assert!(!settings.refine_enabled);
+        }
+    }
+
+    #[test]
+    fn local_models_disable_previously_enabled_cloud_refinement() {
+        for model in [
+            "whisper-base-local",
+            "whisper-tiny-local",
+            "whisper-turbo-local",
+        ] {
+            let settings = AppSettings {
+                transcription_model: model.to_string(),
+                refine_enabled: true,
+                ..AppSettings::default()
+            };
+            assert!(!refinement_enabled_for_model(model, true));
+            assert!(!frontend_settings_from(&settings).refine_enabled);
+        }
+    }
+
+    #[test]
+    fn cloud_models_keep_explicit_refinement_preferences() {
+        for model in [
+            "gpt-4o-mini-transcribe",
+            "gpt-4o-transcribe",
+            "gpt-realtime-transcribe",
+        ] {
+            assert!(refinement_enabled_for_model(model, true));
+            assert!(!refinement_enabled_for_model(model, false));
+        }
     }
 
     #[test]
@@ -2215,6 +2461,79 @@ mod tests {
 
         assert!(settings.hold_to_talk);
         assert!(frontend_settings_from(&settings).hold_to_talk);
+        assert_eq!(settings.recording_shortcut, default_recording_shortcut());
+        assert_eq!(
+            frontend_settings_from(&settings).recording_shortcut,
+            settings.recording_shortcut
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn right_control_shortcut_always_uses_hold_mode() {
+        assert!(hold_to_talk_for_shortcut("RightControl", false));
+        assert!(hold_to_talk_for_shortcut("RightControl", true));
+        assert!(!hold_to_talk_for_shortcut("Control+Alt+Space", false));
+        let settings = AppSettings {
+            recording_shortcut: "RightControl".to_string(),
+            hold_to_talk: false,
+            ..AppSettings::default()
+        };
+        assert!(frontend_settings_from(&settings).hold_to_talk);
+        assert!(recording_shortcut_tooltip(&settings).contains("Right Control"));
+    }
+
+    #[test]
+    fn settings_preserve_selected_shortcut_without_exposing_api_key() {
+        let settings: AppSettings = serde_json::from_value(json!({
+            "recordingShortcut": "Control+Alt+KeyW",
+            "openaiApiKey": Uuid::new_v4().to_string()
+        }))
+        .unwrap();
+        let frontend = serde_json::to_value(frontend_settings_from(&settings)).unwrap();
+        assert_eq!(frontend["recordingShortcut"], "Control+Alt+KeyW");
+        assert!(frontend["recordingShortcutError"].is_null());
+        assert!(frontend.get("openaiApiKey").is_none());
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["recordingShortcut"],
+            "Control+Alt+KeyW"
+        );
+    }
+
+    #[test]
+    fn shortcut_and_pill_changes_keep_the_live_worker() {
+        let previous = AppSettings::default();
+        let updated = AppSettings {
+            recording_shortcut: "Control+Alt+KeyW".to_string(),
+            hold_to_talk: !previous.hold_to_talk,
+            show_idle_pill: !previous.show_idle_pill,
+            ..previous.clone()
+        };
+        assert!(!worker_settings_changed(&previous, &updated));
+        for updated in [
+            AppSettings {
+                openai_api_key: Uuid::new_v4().to_string(),
+                ..previous.clone()
+            },
+            AppSettings {
+                transcription_model: "whisper-tiny-local".into(),
+                ..previous.clone()
+            },
+            AppSettings {
+                transcription_prompt: "test prompt".into(),
+                ..previous.clone()
+            },
+            AppSettings {
+                refine_enabled: !previous.refine_enabled,
+                ..previous.clone()
+            },
+            AppSettings {
+                refine_prompt: "test refinement".into(),
+                ..previous.clone()
+            },
+        ] {
+            assert!(worker_settings_changed(&previous, &updated));
+        }
     }
 
     #[test]
