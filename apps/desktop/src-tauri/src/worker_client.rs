@@ -1,5 +1,6 @@
+use crate::jsonl_client::JsonlChannel;
+pub use crate::jsonl_client::RequestError;
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::io::{self, Write};
@@ -7,31 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use uuid::Uuid;
-
-#[derive(Debug, Serialize)]
-struct WorkerRequest {
-    id: String,
-    method: String,
-    params: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerResponse {
-    id: String,
-    ok: bool,
-    result: Option<Value>,
-    error: Option<WorkerError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerError {
-    code: String,
-    message: String,
-}
 
 /// Everything except finalizing is a quick bookkeeping call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,34 +27,9 @@ fn request_timeout(method: &str) -> Duration {
     }
 }
 
-#[derive(Debug)]
-pub enum RequestError {
-    /// The worker answered with an error; the connection is still healthy.
-    Worker(String),
-    /// The worker timed out, died or desynchronised; the connection cannot be reused.
-    Transport(String),
-}
-
-impl RequestError {
-    pub fn is_transport(&self) -> bool {
-        matches!(self, Self::Transport(_))
-    }
-}
-
-impl std::fmt::Display for RequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Worker(message) | Self::Transport(message) => f.write_str(message),
-        }
-    }
-}
-
 pub struct WorkerClient {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    /// Stderr output captured from the worker process, for error reporting.
-    stderr_buf: Arc<Mutex<String>>,
+    channel: JsonlChannel<ChildStdin, ChildStdout>,
 }
 
 impl WorkerClient {
@@ -204,6 +158,7 @@ impl WorkerClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to open worker stderr"))?;
 
+        // Stderr output captured from the worker process, for error reporting.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let buf_clone = stderr_buf.clone();
         tokio::spawn(async move {
@@ -226,15 +181,13 @@ impl WorkerClient {
 
         Ok(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            stderr_buf,
+            channel: JsonlChannel::new(stdin, stdout, stderr_buf),
         })
     }
 
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, RequestError> {
         let limit = request_timeout(method);
-        match tokio::time::timeout(limit, self.exchange(method, params)).await {
+        match tokio::time::timeout(limit, self.channel.exchange(method, params)).await {
             Ok(result) => result,
             Err(_) => Err(RequestError::Transport(format!(
                 "Worker did not answer {method} within {} seconds",
@@ -243,45 +196,6 @@ impl WorkerClient {
         }
     }
 
-    async fn exchange(&mut self, method: &str, params: Value) -> Result<Value, RequestError> {
-        let transport = |error: &dyn std::fmt::Display| RequestError::Transport(error.to_string());
-        let req = WorkerRequest {
-            id: Uuid::new_v4().to_string(),
-            method: method.to_string(),
-            params,
-        };
-
-        let req_json = serde_json::to_string(&req).map_err(|e| transport(&e))?;
-        self.stdin.write_all(req_json.as_bytes()).await.map_err(|e| transport(&e))?;
-        self.stdin.write_all(b"\n").await.map_err(|e| transport(&e))?;
-        self.stdin.flush().await.map_err(|e| transport(&e))?;
-
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).await.map_err(|e| transport(&e))?;
-        if line.trim().is_empty() {
-            let stderr = self.stderr_buf.lock().await;
-            let msg = if stderr.trim().is_empty() {
-                "Worker process exited unexpectedly".to_string()
-            } else {
-                format!("Worker process exited:\n{}", stderr.trim())
-            };
-            return Err(RequestError::Transport(msg));
-        }
-
-        let response: WorkerResponse = serde_json::from_str(&line).map_err(|e| transport(&e))?;
-        if response.id != req.id {
-            return Err(RequestError::Transport("Worker response id mismatch".to_string()));
-        }
-
-        if response.ok {
-            Ok(response.result.unwrap_or(Value::Null))
-        } else {
-            let err = response
-                .error
-                .ok_or_else(|| RequestError::Worker("Unknown worker error".to_string()))?;
-            Err(RequestError::Worker(format!("{}: {}", err.code, err.message)))
-        }
-    }
 }
 
 fn apply_worker_environment(cmd: &mut Command, openai_api_key: Option<&str>, model: &str) {

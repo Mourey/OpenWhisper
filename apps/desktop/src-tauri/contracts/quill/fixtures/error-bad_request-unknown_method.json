@@ -1,0 +1,12 @@
+{
+  "request_line": "{\"id\":\"u1\",\"method\":\"nope\",\"params\":{}}",
+  "response": {
+    "id": "u1",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "bad_request",
+      "message": "unknown method"
+    }
+  }
+}

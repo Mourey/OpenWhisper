@@ -1,0 +1,22 @@
+{
+  "request": {
+    "id": "e4",
+    "method": "rewrite",
+    "params": {
+      "text": "sample draft for the upstream case",
+      "mode": "task-gpt",
+      "surface": "hotkey",
+      "source_app": null,
+      "target_model": "generic"
+    }
+  },
+  "response": {
+    "id": "e4",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "upstream_error",
+      "message": "upstream error"
+    }
+  }
+}

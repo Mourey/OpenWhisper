@@ -1,0 +1,16 @@
+{
+  "request": {
+    "id": "p1",
+    "method": "ping",
+    "params": {}
+  },
+  "response": {
+    "id": "p1",
+    "ok": true,
+    "result": {
+      "protocol": "quill",
+      "version": "1"
+    },
+    "error": null
+  }
+}

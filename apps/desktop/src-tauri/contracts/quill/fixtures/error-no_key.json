@@ -1,0 +1,21 @@
+{
+  "request": {
+    "id": "e5",
+    "method": "rewrite",
+    "params": {
+      "text": "sample draft for the no key case",
+      "mode": "task-claude",
+      "surface": "hotkey",
+      "source_app": null
+    }
+  },
+  "response": {
+    "id": "e5",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "no_key",
+      "message": "no API key found"
+    }
+  }
+}

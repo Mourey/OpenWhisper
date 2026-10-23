@@ -1,0 +1,18 @@
+{
+  "request": {
+    "id": "e7",
+    "method": "revert",
+    "params": {
+      "rewrite_id": "00000000-0000-4000-8000-000000000001"
+    }
+  },
+  "response": {
+    "id": "e7",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "revert_expired",
+      "message": "revert window expired"
+    }
+  }
+}
