@@ -44,6 +44,29 @@ import {
   deliverTranscript,
   type PasteResult,
 } from "./transcript-delivery";
+import {
+  QuillCatalog,
+  QuillHotkey,
+  QuillPicker,
+  QuillRevertSlot,
+  dictationCleanupEffective,
+  dictationDelivered,
+  escapeHtml,
+  loadModeSelect,
+  modeName,
+  quillHookReady,
+  quillLogLine,
+  quillNoticeDurationMs,
+  recordingStartBlocked,
+  rewriteDictation,
+  settleDictationRewrite,
+  shouldRewriteDictation,
+  toQuillCommandError,
+  type QuillDictationRewrite,
+  type QuillNoticeRole,
+  type QuillPickerView,
+  type QuillRevertView,
+} from "./quill-surfaces";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -62,8 +85,13 @@ type AppSettings = {
   holdToTalk: boolean;
   recordingShortcut: string;
   recordingShortcutError?: string | null;
+  quillCommand?: string;
+  quillCommandError?: string | null;
+  quillEnabled?: boolean;
+  quillDefaultMode?: string;
+  quillDictationCleanup?: boolean;
 };
-type WidgetState = "idle" | "recording" | "transcribing" | "error";
+type WidgetState = "idle" | "recording" | "transcribing" | "error" | "rewriting";
 const isMac = isMacPlatform(navigator.platform, navigator.userAgent);
 const shortcutChoices = getRecordingShortcutChoices(isMac);
 const defaultRecordingShortcut = shortcutChoices[0];
@@ -125,6 +153,9 @@ let recordingStartupVisible = false;
 let currentRecordingCancellation: AbortController | null = null;
 let recordingCancellationCleanup: Promise<void> | null = null;
 let recordingAttemptBackupId: string | null = null;
+// Quill: cleanup decided at session start, and a dictation rewrite awaiting its outcome.
+let quillCleanupAtStart = false;
+let quillDictationPending: QuillDictationRewrite | null = null;
 const audioQueue = new SessionAudioQueue((sessionId, buffer) =>
   invoke<void>("worker_append_audio_chunk", {
     sessionId,
@@ -294,20 +325,35 @@ app.innerHTML = `
       </div>
       <textarea id="menu-prompt-input" class="menu-prompt-input" rows="3" placeholder="e.g. Glossary: @README.md, @package.json, Daniël" spellcheck="false"></textarea>
       <div class="menu-prompt-hint">Custom vocabulary hints for the transcription model (224 token limit)</div>
-      <div id="menu-refine-settings" style="display:none">
-        <div class="menu-divider"></div>
-        <div class="menu-toggle-row">
-          <span class="menu-section menu-section-inline">Refine with AI</span>
-          <label class="toggle-switch">
-            <input id="menu-refine-toggle" type="checkbox" />
-            <span class="toggle-track"></span>
-            <span class="toggle-thumb"></span>
-          </label>
-        </div>
-        <textarea id="menu-refine-prompt-input" class="menu-prompt-input" rows="3" placeholder="Leave blank for default: strip fillers, fix sentences, add lists when enumerated" spellcheck="false"></textarea>
-        <div class="menu-prompt-hint">Custom instructions for the refinement pass (gpt-5-nano). This can add about 1-2 seconds to transcription time.</div>
+      <div class="menu-divider"></div>
+      <div class="menu-section">Quill</div>
+      <div class="menu-toggle-row">
+        <span class="menu-section menu-section-inline">Rewrite with quill</span>
+        <label class="toggle-switch" title="Rewrite the selected text with Control+Option+R">
+          <input id="menu-quill-enabled-toggle" type="checkbox" aria-label="Rewrite with quill" />
+          <span class="toggle-track"></span>
+          <span class="toggle-thumb"></span>
+        </label>
       </div>
+      <select id="menu-quill-mode" class="menu-select" aria-label="Default rewrite mode" disabled></select>
+      <div id="menu-quill-mode-hint" class="menu-prompt-hint">Turn on Quill to choose a mode</div>
+      <div class="menu-toggle-row">
+        <span class="menu-section menu-section-inline">Clean up dictations</span>
+        <label class="toggle-switch" title="Rewrite each finished dictation with quill before inserting it">
+          <input id="menu-quill-cleanup-toggle" type="checkbox" aria-label="Clean up dictations" disabled />
+          <span class="toggle-track"></span>
+          <span class="toggle-thumb"></span>
+        </label>
+      </div>
+      <div id="menu-quill-error" class="menu-prompt-hint" role="alert" style="display:none"></div>
     </div>
+
+    <div id="quill-picker" class="quill-picker hidden" role="listbox" aria-label="Rewrite modes"></div>
+    <div id="quill-revert" class="quill-revert" data-active="false">
+      <span id="quill-revert-text"></span>
+      <button id="quill-revert-button" type="button" aria-keyshortcuts="Control+Alt+Z">Revert <span id="quill-revert-countdown" aria-hidden="true"></span></button>
+    </div>
+    <div id="quill-live" class="visually-hidden" aria-live="polite"></div>
   </div>
 
   <div id="toast" class="toast hidden"></div>
@@ -324,14 +370,22 @@ const micList = document.getElementById("mic-list")!;
 const menuModelSelect = document.getElementById("menu-model-select") as HTMLSelectElement;
 const menuModelHint = document.getElementById("menu-model-hint")!;
 const menuCloudSettings = document.getElementById("menu-cloud-settings")!;
-const menuRefineSettings = document.getElementById("menu-refine-settings")!;
 const toast = document.getElementById("toast")!;
 const menuKeyStatus = document.getElementById("menu-key-status")!;
 const menuKeyInput = document.getElementById("menu-key-input") as HTMLInputElement;
 const menuKeyLink = document.getElementById("menu-key-link") as HTMLAnchorElement;
 const menuPromptInput = document.getElementById("menu-prompt-input") as HTMLTextAreaElement;
-const menuRefineToggle = document.getElementById("menu-refine-toggle") as HTMLInputElement;
-const menuRefinePromptInput = document.getElementById("menu-refine-prompt-input") as HTMLTextAreaElement;
+const menuQuillEnabledToggle = document.getElementById("menu-quill-enabled-toggle") as HTMLInputElement;
+const menuQuillMode = document.getElementById("menu-quill-mode") as HTMLSelectElement;
+const menuQuillModeHint = document.getElementById("menu-quill-mode-hint")!;
+const menuQuillCleanupToggle = document.getElementById("menu-quill-cleanup-toggle") as HTMLInputElement;
+const menuQuillError = document.getElementById("menu-quill-error")!;
+const quillPickerElement = document.getElementById("quill-picker")!;
+const quillRevertElement = document.getElementById("quill-revert")!;
+const quillRevertText = document.getElementById("quill-revert-text")!;
+const quillRevertButton = document.getElementById("quill-revert-button") as HTMLButtonElement;
+const quillRevertCountdown = document.getElementById("quill-revert-countdown")!;
+const quillLive = document.getElementById("quill-live")!;
 const menuShowIdlePillToggle = document.getElementById("menu-show-idle-pill-toggle") as HTMLInputElement;
 const menuHoldToTalkToggle = document.getElementById("menu-hold-to-talk-toggle") as HTMLInputElement;
 const menuRecordingShortcut = document.getElementById("menu-recording-shortcut") as HTMLSelectElement;
@@ -361,8 +415,9 @@ let keyRevealInFlight = false;
 let promptDirty = false;
 let promptSaveInFlight = false;
 let modelSaveInFlight = false;
-let refineDirty = false;
-let refineSaveInFlight = false;
+let quillSettings: AppSettings | null = null;
+let quillSaveInFlight = false;
+let quillSaveError: string | null = null;
 let showIdlePill = true;
 let showIdlePillSaveInFlight = false;
 let holdToTalkSaveInFlight = false;
@@ -420,16 +475,26 @@ function setWidgetHovered(next: boolean) {
   void applyOverlayLayout();
 }
 
+/** The open picker and the active revert slot, which grow the window like the menu. */
+function quillOverlayRects() {
+  const rects: DOMRect[] = [];
+  if (quillPicker.isOpen) rects.push(quillPickerElement.getBoundingClientRect());
+  if (quillRevertElement.dataset.active === "true") rects.push(quillRevertElement.getBoundingClientRect());
+  return rects;
+}
+
 function getWindowLayout() {
   const menuVisible = menuOpen && !micMenu.classList.contains("hidden");
   const menuRect = menuVisible ? micMenu.getBoundingClientRect() : undefined;
+  const quillRects = quillOverlayRects();
+  const overlayRects = [...(menuRect ? [menuRect] : []), ...quillRects];
   const layout = getOverlayLayout({
     expanded: isWidgetExpanded(),
     settingsLoaded,
     hasOpenaiApiKey: !needsApiKey(transcriptionModel, hasOpenaiApiKey) || state !== "idle",
-    menuVisible,
-    menuWidth: menuRect?.width,
-    menuHeight: menuRect?.height,
+    menuVisible: menuVisible || quillRects.length > 0,
+    menuWidth: overlayRects.length ? Math.max(...overlayRects.map((rect) => rect.width)) : undefined,
+    menuHeight: overlayRects.length ? Math.max(...overlayRects.map((rect) => rect.height)) : undefined,
   });
   return {
     ...layout,
@@ -439,7 +504,7 @@ function getWindowLayout() {
       menuOpen,
       manuallyRevealed: manualOverlayReveal,
       starting: recordingStartupVisible,
-    }),
+    }) || quillRects.length > 0,
   };
 }
 
@@ -563,6 +628,12 @@ apiKeyBubble.addEventListener("keydown", (e) => {
 });
 
 function handleWidgetClick(e: MouseEvent) {
+  if (quillPicker.isOpen) {
+    quillPicker.click();
+    e.stopPropagation();
+    e.preventDefault();
+    return;
+  }
   if (menuOpen) {
     closeMenu();
     e.stopPropagation();
@@ -653,11 +724,107 @@ window.addEventListener("blur", () => {
 // Toast
 // ---------------------------------------------------------------------------
 let toastTimer: number | null = null;
-function showToast(msg: string, durationMs = 3000) {
+function showToast(msg: string, durationMs = 3000, role?: QuillNoticeRole) {
+  if (role) toast.setAttribute("role", role);
+  else toast.removeAttribute("role");
   toast.textContent = msg;
   toast.classList.remove("hidden");
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toast.classList.add("hidden"), durationMs);
+}
+
+// ---------------------------------------------------------------------------
+// Quill: hotkey, picker, revert slot
+// ---------------------------------------------------------------------------
+const quillInvoke = (cmd: string, args?: Record<string, unknown>) => invoke<unknown>(cmd, args);
+
+function showQuillNotice(text: string, role: QuillNoticeRole) {
+  showToast(text, quillNoticeDurationMs(role), role);
+}
+
+function announceQuill(text: string) {
+  quillLive.textContent = text;
+}
+
+function renderQuillPicker(view: QuillPickerView) {
+  quillPickerElement.classList.toggle("hidden", !view.open);
+  quillPickerElement.innerHTML = view.open
+    ? view.rows.map((row, index) => `
+      <div class="quill-picker-row" role="option" id="quill-picker-row-${index}" aria-selected="${row.selected}">
+        <span class="quill-picker-index" aria-hidden="true">${(index + 1) % 10}</span>
+        <span class="quill-picker-name">${escapeHtml(row.name)}</span>
+        ${row.isDefault ? '<span class="quill-picker-check" aria-hidden="true">✓</span><span class="visually-hidden">default</span>' : "<span></span>"}
+        ${row.selected ? `<span class="quill-picker-description">${escapeHtml(view.description)}</span>` : ""}
+      </div>`).join("")
+    : "";
+  const selected = view.rows.findIndex((row) => row.selected);
+  if (view.open && selected >= 0) quillPickerElement.setAttribute("aria-activedescendant", `quill-picker-row-${selected}`);
+  else quillPickerElement.removeAttribute("aria-activedescendant");
+  void applyOverlayLayout();
+}
+
+function renderQuillRevert(view: QuillRevertView) {
+  const wasActive = quillRevertElement.dataset.active === "true";
+  quillRevertElement.dataset.active = String(view.visible);
+  quillRevertText.textContent = view.label;
+  quillRevertCountdown.textContent = view.countdown;
+  if (wasActive !== view.visible) void applyOverlayLayout();
+}
+
+const quillCatalog = new QuillCatalog(quillInvoke);
+const quillPicker = new QuillPicker({ announce: announceQuill, render: renderQuillPicker });
+const quillSlot = new QuillRevertSlot({
+  invoke: quillInvoke,
+  notify: showQuillNotice,
+  announce: announceQuill,
+  render: renderQuillRevert,
+  log: (line) => logDebug(line),
+});
+const quillHotkey = new QuillHotkey({
+  invoke: quillInvoke,
+  catalog: quillCatalog,
+  picker: quillPicker,
+  storedDefault: () => quillSettings?.quillDefaultMode ?? "",
+  notify: showQuillNotice,
+  onRewritten: (rewrite) => quillSlot.open(rewrite),
+  log: (line) => logDebug(line),
+});
+
+quillRevertButton.addEventListener("click", (e) => {
+  e.stopPropagation();
+  void quillSlot.revert();
+});
+
+/** Rewrites the finished dictation while the widget shows `rewriting`; null keeps the raw text. */
+async function rewriteFinishedDictation(text: string) {
+  setState("rewriting");
+  try {
+    return await rewriteDictation({
+      invoke: quillInvoke,
+      text,
+      notify: showQuillNotice,
+      announce: announceQuill,
+      log: (line) => logDebug(line),
+    });
+  } finally {
+    setState("transcribing");
+  }
+}
+
+/** Ends the clipboard hold, reports the delivery and opens the revert slot. */
+async function settleQuillDictation(delivery: { inserted: boolean } | null) {
+  const rewrite = quillDictationPending;
+  if (!rewrite) return;
+  quillDictationPending = null;
+  await settleDictationRewrite({
+    invoke: quillInvoke,
+    rewriteId: rewrite.rewriteId,
+    delivered: dictationDelivered(delivery),
+    pasted: rewrite.text,
+    slot: quillSlot,
+    name: modeName(quillCatalog.modes, rewrite.mode),
+    log: (line) => logDebug(line),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +1275,7 @@ async function startRecording() {
     `startRecording enter state=${state} held=${pressToTalkHeld} starting=${pressToTalkStarting}`,
   );
   if (state !== "idle") return;
+  quillPicker.close();
   const cancellation = new AbortController();
   currentRecordingCancellation = cancellation;
   recordingCancellationCleanup = null;
@@ -1155,6 +1323,7 @@ async function startRecording() {
     logStartupStage("paste target complete");
     const settings = await cancellableRecordingStep(signal, () => waitForStartupStep("Loading recording settings", () => invoke<AppSettings>("app_get_settings")));
     logStartupStage("settings ready");
+    quillCleanupAtStart = dictationCleanupEffective(settings);
     if (needsApiKey(settings.transcriptionModel, settings.hasOpenaiApiKey)) {
       showToast("Set your OpenAI API key first (click arrow)");
       setState("idle");
@@ -1601,6 +1770,21 @@ async function pollOnce() {
       if (finalTranscript) {
         await targetWriteQueue;
         if (signal?.aborted || currentSessionId !== sessionId) return;
+        const quillRewrite = shouldRewriteDictation({
+          cleanupEffective: quillCleanupAtStart,
+          copyOnly: !shouldPasteFinalTranscript,
+          streaming: streamTextToTarget,
+        })
+          ? await rewriteFinishedDictation(finalTranscript)
+          : null;
+        if (signal?.aborted || currentSessionId !== sessionId) return;
+        if (quillRewrite) {
+          finalTranscript = quillRewrite.text;
+          quillDictationPending = quillRewrite;
+          await invoke<void>("quill_clipboard_hold").catch((error) => {
+            logDebug(quillLogLine("clipboard_hold_failed", toQuillCommandError(error).code));
+          });
+        }
         lastTranscript = finalTranscript;
         localStorage.setItem("ow_last_transcript", lastTranscript);
         syncWidgetFrame();
@@ -1621,6 +1805,7 @@ async function pollOnce() {
         if (!delivery || signal?.aborted || currentSessionId !== sessionId) return;
         await finishCurrentRecording("complete", finalTranscript, "");
         if (signal?.aborted || currentSessionId !== sessionId) return;
+        await settleQuillDictation(delivery);
         if (delivery.notice) showToast(delivery.notice, 6000);
         if (delivery.needsPasteAccess && !pasteAccessRequested) {
           pasteAccessRequested = true;
@@ -1650,6 +1835,8 @@ async function pollOnce() {
     }
   } finally {
     pollInFlight = false;
+    // A rewrite whose delivery was abandoned still ends its clipboard hold.
+    if (quillDictationPending) void settleQuillDictation(null);
   }
 }
 
@@ -1693,6 +1880,7 @@ if (import.meta.env.DEV) {
 // Toggle
 // ---------------------------------------------------------------------------
 async function toggleRecording() {
+  if (recordingStartBlocked(state)) return;
   if (state === "idle") {
     if (pressToTalkStarting) return;
     if (toggleRecordingStarting) {
@@ -1720,6 +1908,7 @@ async function handlePressToTalkStart() {
   logDebug(
     `pressToTalkStart event state=${state} held=${pressToTalkHeld} starting=${pressToTalkStarting}`,
   );
+  if (recordingStartBlocked(state)) return;
   pressToTalkHeld = true;
   if (state !== "idle" || pressToTalkStarting || toggleRecordingStarting) return;
 
@@ -1743,6 +1932,7 @@ async function handlePressToTalkStop() {
     `pressToTalkStop event state=${state} held=${pressToTalkHeld} starting=${pressToTalkStarting}`,
   );
   pressToTalkHeld = false;
+  if (state === "rewriting") return;
   if (currentRecordingCancellation?.signal.aborted) return;
   if (shouldCancelEmptyHold({ starting: pressToTalkStarting, state, capturedBytes: capturedPcmBytes })) {
     await handlePressToTalkCancel();
@@ -1779,23 +1969,6 @@ function restoreStoredKeyPreview() {
   applyStoredKeyPreview(storedKeyPreview || null);
 }
 
-function syncRefinePromptVisibility() {
-  const cloudRefinement = getModelCapabilities(menuModelSelect.value as TranscriptionModel).allowsCloudRefinement;
-  const enabled = cloudRefinement && menuRefineToggle.checked;
-  menuRefineSettings.style.display = cloudRefinement ? "" : "none";
-  menuRefineToggle.disabled = !cloudRefinement;
-  menuRefinePromptInput.disabled = !cloudRefinement;
-  if (!cloudRefinement) menuRefineToggle.checked = false;
-  menuRefinePromptInput.style.display = enabled ? "" : "none";
-  menuRefinePromptInput.nextElementSibling?.setAttribute(
-    "style",
-    enabled ? "" : "display:none",
-  );
-  if (menuOpen) {
-    void applyOverlayLayout();
-  }
-}
-
 const MODEL_HINTS: Record<TranscriptionModel, string> = {
   "whisper-base-local":
     "Recommended local model. Multilingual Whisper Base, quantized to 60 MB. Transcribes on this Mac after you stop recording. No API key or usage fees.",
@@ -1815,7 +1988,6 @@ function syncModelHint() {
   const model = menuModelSelect.value as TranscriptionModel;
   menuModelHint.textContent = MODEL_HINTS[model] ?? "";
   menuCloudSettings.style.display = getModelCapabilities(model).requiresApiKey ? "" : "none";
-  syncRefinePromptVisibility();
 }
 
 function syncRecordingShortcutUi(error: string | null = null) {
@@ -1855,11 +2027,7 @@ function applySettingsUi(settings: AppSettings, configuredLabel = "Key configure
   if (!promptDirty) {
     menuPromptInput.value = settings.transcriptionPrompt ?? "";
   }
-  if (!refineDirty) {
-    menuRefineToggle.checked = getModelCapabilities(transcriptionModel).allowsCloudRefinement && (settings.refineEnabled ?? false);
-    menuRefinePromptInput.value = settings.refinePrompt ?? "";
-    syncRefinePromptVisibility();
-  }
+  syncQuillSettingsUi(settings);
   if ((bubbleVisibilityChanged || lastAppliedLayout?.visible !== getWindowLayout().visible) && lastAppliedLayout !== null) {
     void applyOverlayLayout();
   }
@@ -2085,40 +2253,77 @@ menuPromptInput.addEventListener("blur", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Settings (Refine)
+// Settings (Quill)
 // ---------------------------------------------------------------------------
-async function persistRefineInput() {
-  if (refineSaveInFlight || !refineDirty) return;
+let quillModeSelectRequest = 0;
 
-  refineSaveInFlight = true;
+function syncQuillError() {
+  const error = quillSaveError ?? quillSettings?.quillCommandError ?? null;
+  menuQuillError.textContent = error ?? "";
+  menuQuillError.style.display = error ? "" : "none";
+}
+
+function syncQuillSettingsUi(settings: AppSettings) {
+  const previous = quillSettings;
+  quillSettings = settings;
+  menuQuillEnabledToggle.checked = settings.quillEnabled ?? false;
+  menuQuillCleanupToggle.checked = settings.quillDictationCleanup ?? false;
+  menuQuillCleanupToggle.disabled = !quillHookReady(settings);
+  syncQuillError();
+  if (!quillHookReady(settings)) {
+    quillCatalog.clear();
+    quillPicker.close();
+  } else if (!previous || !quillHookReady(previous) || previous.quillCommand !== settings.quillCommand) {
+    quillCatalog.clear();
+  }
+  void syncQuillModeSelect(settings);
+}
+
+/** Fills the default-mode select only while the hook is on and valid (no engine call otherwise). */
+async function syncQuillModeSelect(settings: AppSettings) {
+  const request = ++quillModeSelectRequest;
+  // The catalog answers repeat loads, so a settings save does not call the engine again.
+  const select = await loadModeSelect(settings, (cmd, args) =>
+    cmd === "quill_list_modes" ? quillCatalog.load().then((modes) => ({ modes })) : quillInvoke(cmd, args));
+  if (request !== quillModeSelectRequest) return;
+  menuQuillMode.innerHTML = select.options
+    .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+    .join("");
+  menuQuillMode.disabled = select.disabled;
+  if (select.selected) menuQuillMode.value = select.selected;
+  menuQuillModeHint.textContent = select.hint ?? "";
+  menuQuillModeHint.style.display = select.hint ? "" : "none";
+  if (menuOpen) void applyOverlayLayout();
+}
+
+async function saveQuillSettings(update: Record<string, unknown>, success: string) {
+  if (quillSaveInFlight) return;
+  quillSaveInFlight = true;
   try {
-    const updated = await invoke<AppSettings>("app_save_settings", {
-      refineEnabled: getModelCapabilities(transcriptionModel).allowsCloudRefinement && menuRefineToggle.checked,
-      refinePrompt: menuRefinePromptInput.value,
-    });
-    refineDirty = false;
-    applySettingsUi(updated, updated.hasOpenaiApiKey ? "Key configured" : "Not configured");
+    const updated = await invoke<AppSettings>("app_save_settings", update);
+    quillSaveError = null;
+    applySettingsUi(updated);
+    showToast(success);
   } catch (err) {
-    refineDirty = true;
-    showToast(err instanceof Error ? err.message : String(err));
+    quillSaveError = err instanceof Error ? err.message : String(err);
+    await loadSettings();
   } finally {
-    refineSaveInFlight = false;
+    quillSaveInFlight = false;
   }
 }
 
-menuRefineToggle.addEventListener("change", () => {
-  refineDirty = true;
-  syncRefinePromptVisibility();
-  void persistRefineInput();
+menuQuillEnabledToggle.addEventListener("change", () => {
+  const enabled = menuQuillEnabledToggle.checked;
+  void saveQuillSettings({ quillEnabled: enabled }, enabled ? "Rewrite with quill on" : "Rewrite with quill off");
 });
 
-menuRefinePromptInput.addEventListener("input", () => {
-  refineDirty = true;
+menuQuillCleanupToggle.addEventListener("change", () => {
+  const cleanup = menuQuillCleanupToggle.checked;
+  void saveQuillSettings({ quillDictationCleanup: cleanup }, cleanup ? "Dictation cleanup on" : "Dictation cleanup off");
 });
 
-menuRefinePromptInput.addEventListener("blur", () => {
-  if (!refineDirty) return;
-  void persistRefineInput();
+menuQuillMode.addEventListener("change", () => {
+  void saveQuillSettings({ quillDefaultMode: menuQuillMode.value }, "Default rewrite mode saved");
 });
 
 // ---------------------------------------------------------------------------
@@ -2168,6 +2373,15 @@ void listen("press-to-talk-cancel", () => {
 });
 void listen("recording-shortcut-status-changed", () => {
   void loadSettings();
+});
+void listen("quill-rewrite", () => {
+  quillHotkey.press();
+});
+void listen<string>("quill-picker-key", (event) => {
+  quillHotkey.pickerKey(event.payload);
+});
+void listen("quill-revert", () => {
+  void quillSlot.revertFromHotkey();
 });
 void listen<boolean>("overlay-revealed", (event) => {
   manualOverlayReveal = event.payload;
