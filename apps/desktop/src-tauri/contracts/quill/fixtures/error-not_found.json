@@ -1,0 +1,18 @@
+{
+  "request": {
+    "id": "e1",
+    "method": "revert",
+    "params": {
+      "rewrite_id": "00000000-0000-4000-8000-0000000000ff"
+    }
+  },
+  "response": {
+    "id": "e1",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "not_found",
+      "message": "rewrite not found"
+    }
+  }
+}

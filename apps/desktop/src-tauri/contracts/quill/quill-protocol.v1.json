@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quill.local/contracts/quill-protocol/v1",
+  "title": "quill protocol v1",
+  "description": "JSON lines over stdio between OpenWhisper and quill serve: one request object per line in, one response object per line out, strictly serial. Optional keys are absent, never null; nullable keys are always present.",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "method": {
+          "enum": [
+            "ping",
+            "list_modes",
+            "rewrite",
+            "outcome",
+            "revert"
+          ]
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "method": {
+              "const": "ping"
+            },
+            "params": {
+              "$ref": "#/$defs/ping_params"
+            }
+          }
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "list_modes"
+            },
+            "params": {
+              "$ref": "#/$defs/list_modes_params"
+            }
+          }
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "rewrite"
+            },
+            "params": {
+              "$ref": "#/$defs/rewrite_params"
+            }
+          }
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "outcome"
+            },
+            "params": {
+              "$ref": "#/$defs/outcome_params"
+            }
+          }
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "revert"
+            },
+            "params": {
+              "$ref": "#/$defs/revert_params"
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "type": "object",
+      "required": [
+        "id",
+        "ok",
+        "result",
+        "error"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object"
+            },
+            "error": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "result": {
+              "type": "null"
+            },
+            "error": {
+              "$ref": "#/$defs/error"
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "not_found",
+            "bad_request",
+            "internal_error",
+            "timeout",
+            "upstream_error",
+            "no_key",
+            "unknown_mode",
+            "revert_expired"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ping_params": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": false
+    },
+    "list_modes_params": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": false
+    },
+    "rewrite_params": {
+      "type": "object",
+      "required": [
+        "text",
+        "mode",
+        "surface",
+        "source_app"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "mode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "surface": {
+          "enum": [
+            "hotkey",
+            "pill",
+            "cli"
+          ]
+        },
+        "source_app": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "target_model": {
+          "enum": [
+            "claude",
+            "gpt",
+            "generic",
+            "any"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "outcome_params": {
+      "type": "object",
+      "required": [
+        "rewrite_id",
+        "delivered"
+      ],
+      "properties": {
+        "rewrite_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "delivered": {
+          "enum": [
+            "inserted",
+            "copied",
+            "printed",
+            "failed"
+          ]
+        },
+        "reverted_via": {
+          "enum": [
+            "inserted",
+            "copied"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "revert_params": {
+      "type": "object",
+      "required": [
+        "rewrite_id"
+      ],
+      "properties": {
+        "rewrite_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "ping_result": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "version"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "quill"
+        },
+        "version": {
+          "const": "1"
+        }
+      },
+      "additionalProperties": false
+    },
+    "list_modes_result": {
+      "type": "object",
+      "required": [
+        "modes"
+      ],
+      "properties": {
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "description",
+              "form",
+              "target_model",
+              "default"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "form": {
+                "enum": [
+                  "task",
+                  "system",
+                  "skill",
+                  "dictation"
+                ]
+              },
+              "target_model": {
+                "enum": [
+                  "claude",
+                  "gpt",
+                  "generic",
+                  "any"
+                ]
+              },
+              "default": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rewrite_result": {
+      "type": "object",
+      "required": [
+        "rewrite_id",
+        "text",
+        "mode",
+        "model",
+        "latency_ms"
+      ],
+      "properties": {
+        "rewrite_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "outcome_result": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": false
+    },
+    "revert_result": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "fixture": {
+      "type": "object",
+      "required": [
+        "response"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/request"
+        },
+        "request_line": {
+          "type": "string"
+        },
+        "response": {
+          "$ref": "#/$defs/response"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "request"
+          ]
+        },
+        {
+          "required": [
+            "request_line"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "request": {
+    "id": "e6",
+    "method": "rewrite",
+    "params": {
+      "text": "sample draft for the unknown mode case",
+      "mode": "no-such-mode",
+      "surface": "hotkey",
+      "source_app": null
+    }
+  },
+  "response": {
+    "id": "e6",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "unknown_mode",
+      "message": "unknown mode"
+    }
+  }
+}

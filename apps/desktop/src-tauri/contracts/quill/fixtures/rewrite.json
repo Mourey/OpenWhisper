@@ -1,0 +1,24 @@
+{
+  "request": {
+    "id": "r1",
+    "method": "rewrite",
+    "params": {
+      "text": "sample draft: make the widget list sort by name pls",
+      "mode": "task-claude",
+      "surface": "hotkey",
+      "source_app": null
+    }
+  },
+  "response": {
+    "id": "r1",
+    "ok": true,
+    "result": {
+      "rewrite_id": "00000000-0000-4000-8000-000000000001",
+      "text": "Sort the widget list by name, ascending.",
+      "mode": "task-claude",
+      "model": "anthropic/claude-haiku-5.5",
+      "latency_ms": 812
+    },
+    "error": null
+  }
+}

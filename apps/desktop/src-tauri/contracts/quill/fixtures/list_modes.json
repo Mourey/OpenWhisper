@@ -1,0 +1,32 @@
+{
+  "request": {
+    "id": "m1",
+    "method": "list_modes",
+    "params": {}
+  },
+  "response": {
+    "id": "m1",
+    "ok": true,
+    "result": {
+      "modes": [
+        {
+          "id": "task-claude",
+          "name": "Task prompt for Claude",
+          "description": "Rewrites a one-off request as a clear task prompt for Claude models.",
+          "form": "task",
+          "target_model": "claude",
+          "default": true
+        },
+        {
+          "id": "system-gpt",
+          "name": "System prompt for GPT",
+          "description": "Rewrites notes or an existing system prompt as developer instructions for OpenAI GPT-6 models.",
+          "form": "system",
+          "target_model": "gpt",
+          "default": false
+        }
+      ]
+    },
+    "error": null
+  }
+}

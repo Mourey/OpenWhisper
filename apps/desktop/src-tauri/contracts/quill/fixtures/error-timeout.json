@@ -1,0 +1,21 @@
+{
+  "request": {
+    "id": "e3",
+    "method": "rewrite",
+    "params": {
+      "text": "sample draft for the timeout case",
+      "mode": "task-claude",
+      "surface": "hotkey",
+      "source_app": "com.example.editor"
+    }
+  },
+  "response": {
+    "id": "e3",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "timeout",
+      "message": "upstream timed out"
+    }
+  }
+}

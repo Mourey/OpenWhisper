@@ -1,0 +1,17 @@
+{
+  "request": {
+    "id": "o1",
+    "method": "outcome",
+    "params": {
+      "rewrite_id": "00000000-0000-4000-8000-000000000001",
+      "delivered": "inserted",
+      "reverted_via": "copied"
+    }
+  },
+  "response": {
+    "id": "o1",
+    "ok": true,
+    "result": {},
+    "error": null
+  }
+}

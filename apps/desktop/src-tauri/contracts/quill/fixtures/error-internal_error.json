@@ -1,0 +1,19 @@
+{
+  "request": {
+    "id": "e2",
+    "method": "outcome",
+    "params": {
+      "rewrite_id": "00000000-0000-4000-8000-000000000001",
+      "delivered": "copied"
+    }
+  },
+  "response": {
+    "id": "e2",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "internal_error",
+      "message": "internal error"
+    }
+  }
+}

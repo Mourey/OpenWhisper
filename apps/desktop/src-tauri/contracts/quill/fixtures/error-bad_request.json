@@ -1,0 +1,12 @@
+{
+  "request_line": "not json",
+  "response": {
+    "id": "",
+    "ok": false,
+    "result": null,
+    "error": {
+      "code": "bad_request",
+      "message": "invalid request"
+    }
+  }
+}
