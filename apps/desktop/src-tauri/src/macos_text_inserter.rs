@@ -479,8 +479,20 @@ fn anchor_after_insertion<P: Platform>(
     (start >= 0).then_some(Anchor { start, len })
 }
 
-/// How the slot's own rewrite reached the user; `None` for any other rewrite id.
-fn slot_delivery<T>(slot: &Option<QuillSlot<T>>, rewrite_id: &str) -> Option<Delivery> {
+/// Clears a slot older than 30 s, measured from its capture.
+fn expire_aged_slot<T>(slot: &mut Option<QuillSlot<T>>, now: Instant) {
+    if slot
+        .as_ref()
+        .is_some_and(|slot| now.saturating_duration_since(slot.captured_at) >= QUILL_SLOT_TTL)
+    {
+        *slot = None;
+    }
+}
+
+/// How the slot's own rewrite reached the user; `None` for any other rewrite id or once the
+/// slot has aged out (which clears it).
+fn slot_delivery<T>(slot: &mut Option<QuillSlot<T>>, rewrite_id: &str, now: Instant) -> Option<Delivery> {
+    expire_aged_slot(slot, now);
     slot.as_ref()
         .filter(|slot| slot.rewrite_id.as_deref() == Some(rewrite_id))
         .and_then(|slot| slot.delivered)
@@ -509,12 +521,7 @@ fn slot_revert<P: Platform>(
     original: &str,
     now: Instant,
 ) -> RevertAtAnchor {
-    if slot
-        .as_ref()
-        .is_some_and(|slot| now.saturating_duration_since(slot.captured_at) >= QUILL_SLOT_TTL)
-    {
-        *slot = None;
-    }
+    expire_aged_slot(slot, now);
     let Some(slot) = slot.as_mut() else {
         return RevertAtAnchor::Copied;
     };
@@ -584,7 +591,7 @@ pub fn replace_selection(text: &str) -> ReplaceReport {
 
 /// How the quill slot's rewrite was delivered, if `rewrite_id` is that rewrite.
 pub fn quill_slot_delivery(rewrite_id: &str) -> Option<Delivery> {
-    slot_delivery(&quill_state(), rewrite_id)
+    slot_delivery(&mut quill_state(), rewrite_id, Instant::now())
 }
 
 /// Records the rewrite on the quill slot so a later revert can find it.
@@ -1864,12 +1871,24 @@ mod tests {
 
     #[test]
     fn quill_revert_at_anchor_slot_delivery_is_known_only_for_the_slots_own_rewrite() {
-        let (_, mut slot, _) = reverted_fixture();
-        assert_eq!(slot_delivery(&slot, "rw-1"), Some(Delivery::Inserted));
-        assert_eq!(slot_delivery(&slot, "rw-2"), None);
+        let (_, mut slot, base) = reverted_fixture();
+        assert_eq!(slot_delivery(&mut slot, "rw-1", base), Some(Delivery::Inserted));
+        assert_eq!(slot_delivery(&mut slot, "rw-2", base), None);
         slot.as_mut().unwrap().delivered = None;
-        assert_eq!(slot_delivery(&slot, "rw-1"), None);
-        assert_eq!(slot_delivery::<FakeTarget>(&None, "rw-1"), None);
+        assert_eq!(slot_delivery(&mut slot, "rw-1", base), None);
+        assert_eq!(slot_delivery::<FakeTarget>(&mut None, "rw-1", base), None);
+    }
+
+    #[test]
+    fn quill_revert_at_anchor_slot_delivery_expires_with_the_slot_after_30_seconds() {
+        let (_, mut slot, base) = reverted_fixture();
+        assert_eq!(
+            slot_delivery(&mut slot, "rw-1", base + Duration::from_secs(29)),
+            Some(Delivery::Inserted)
+        );
+        assert!(slot.is_some());
+        assert_eq!(slot_delivery(&mut slot, "rw-1", base + Duration::from_secs(31)), None);
+        assert!(slot.is_none(), "an aged slot is cleared on access");
     }
 
     #[test]

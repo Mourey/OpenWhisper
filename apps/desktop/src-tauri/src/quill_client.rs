@@ -763,7 +763,25 @@ pub async fn lease_quill<'a>(
     raw_command: &str,
     env: &QuillEnv<'_>,
 ) -> Result<QuillLease<'a>, QuillCommandError> {
-    let mut guard = slot.try_lock().map_err(|_| QuillCommandError::busy())?;
+    lease_claimed(claim_slot(slot)?, raw_command, env).await
+}
+
+/// Takes the slot without waiting; `busy` when another call holds it. A caller that must
+/// look something up before starting the engine claims first, so a busy slot is reported
+/// at once, and then finishes with `lease_claimed`.
+pub fn claim_slot(
+    slot: &Mutex<Option<QuillClient>>,
+) -> Result<MutexGuard<'_, Option<QuillClient>>, QuillCommandError> {
+    slot.try_lock().map_err(|_| QuillCommandError::busy())
+}
+
+/// Revalidates the command and fills the claimed slot, as `lease_quill` does after its
+/// `try_lock`.
+pub async fn lease_claimed<'a>(
+    mut guard: MutexGuard<'a, Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+) -> Result<QuillLease<'a>, QuillCommandError> {
     let canonical = match validate_quill_command(raw_command, env.fs) {
         Ok(canonical) => canonical,
         Err(message) => {
@@ -1088,13 +1106,18 @@ pub async fn run_revert<H: QuillHost>(
     delivered: Option<&str>,
 ) -> Result<QuillRevertResult, QuillCommandError> {
     let supplied = delivered.map(parse_delivered).transpose()?;
-    let held = host.slot_delivery(rewrite_id);
-    let delivered = held
-        .or(supplied)
-        .ok_or_else(|| bad_request("delivered is required to revert a rewrite that was not inserted by the hotkey."))?;
 
-    let mut lease = lease_quill(slot, raw_command, env).await?;
+    // Claim the slot first: it answers `busy` at once, while the host's slot lookup may
+    // wait on a read or replace that holds the target slot. The lookup still precedes the
+    // engine, so a missing `delivered` is refused without starting it.
+    let claimed = claim_slot(slot)?;
+    let held = host.slot_delivery(rewrite_id);
+    let delivered = held.or(supplied).ok_or_else(|| {
+        bad_request("delivered is required to revert a rewrite that was not inserted by the hotkey.")
+    })?;
+    let mut lease = lease_claimed(claimed, raw_command, env).await?;
     let client = lease.client();
+
     let original: RevertResult = client
         .request_typed(
             QuillMethod::Revert,
@@ -2437,6 +2460,9 @@ esac"#;
         source_app: Option<String>,
         replace: HostReplace,
         slot_delivery: Option<Delivered>,
+        /// Stands for the target-slot lock being busy: the lookup blocks this long.
+        slot_delivery_delay: Duration,
+        slot_delivery_calls: usize,
         revert_inserts: bool,
         copy_ok: bool,
         clock: std::sync::Mutex<std::collections::VecDeque<u64>>,
@@ -2457,6 +2483,8 @@ esac"#;
                     clipboard_replaced: false,
                 },
                 slot_delivery: None,
+                slot_delivery_delay: Duration::ZERO,
+                slot_delivery_calls: 0,
                 revert_inserts: true,
                 copy_ok: true,
                 clock: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -2503,6 +2531,8 @@ esac"#;
         }
 
         fn slot_delivery(&mut self, _rewrite_id: &str) -> Option<Delivered> {
+            self.slot_delivery_calls += 1;
+            std::thread::sleep(self.slot_delivery_delay);
             self.slot_delivery
         }
 
@@ -2557,6 +2587,57 @@ esac"#;
             .filter(|request| request["method"] == method)
             .map(|request| request["params"].clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn quill_timeout_every_command_returns_busy_at_once_before_touching_the_target_slot() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let _held = slot.lock().await;
+        // A read or replace in progress holds the target slot, so any lookup there blocks.
+        let mut host = FakeHost::new();
+        host.slot_delivery = Some(Delivered::Inserted);
+        host.slot_delivery_delay = Duration::from_millis(300);
+        let busy = |error: QuillCommandError, started: Instant| {
+            assert_eq!(error.code, QuillErrorCode::Busy);
+            let elapsed = started.elapsed();
+            assert!(elapsed < Duration::from_millis(50), "busy took {elapsed:?}");
+        };
+
+        let started = Instant::now();
+        busy(
+            run_revert(&slot, fake.command(), &env, &mut host, "rw-1", Some("inserted"))
+                .await
+                .unwrap_err(),
+            started,
+        );
+        assert_eq!(host.slot_delivery_calls, 0, "the target slot is not touched before the lease");
+
+        let started = Instant::now();
+        busy(
+            run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+                .await
+                .unwrap_err(),
+            started,
+        );
+        assert!(host.calls.is_empty());
+        let started = Instant::now();
+        busy(
+            run_rewrite_text(&slot, fake.command(), &env, &host, text_args("pill")).await.unwrap_err(),
+            started,
+        );
+        let started = Instant::now();
+        busy(
+            run_report_outcome(&slot, fake.command(), &env, "rw-1", "inserted", None)
+                .await
+                .unwrap_err(),
+            started,
+        );
+        let started = Instant::now();
+        busy(run_list_modes(&slot, fake.command(), &env).await.unwrap_err(), started);
+        assert_eq!(fake.spawn_count(), 0);
     }
 
     // quill_flow_: rewrite_selection
