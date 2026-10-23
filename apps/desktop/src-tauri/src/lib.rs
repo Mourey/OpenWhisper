@@ -28,6 +28,11 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use quill_client::{
+    NativeFs, QuillClient, QuillCommandError, QuillEnv, QuillListModesResult,
+    QuillReportOutcomeResult, QuillRevertResult, QuillRewriteSelectionResult,
+    QuillRewriteTextResult, QUILL_REQUEST_TIMEOUT,
+};
 use worker_client::WorkerClient;
 
 const SECONDARY_MONITOR_VERTICAL_OFFSET_LOGICAL: f64 = 2.0;
@@ -742,6 +747,29 @@ fn default_recording_shortcut() -> String {
     }
 }
 
+/// `$HOME/.local/bin/quill`, where `uv tool install` puts the launcher; empty without a home.
+fn default_quill_command_for(home: Option<std::ffi::OsString>) -> String {
+    match home {
+        Some(home) if !home.is_empty() => PathBuf::from(home)
+            .join(".local/bin/quill")
+            .to_string_lossy()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn default_quill_command() -> String {
+    default_quill_command_for(std::env::var_os("HOME"))
+}
+
+/// Stores the requested quill command trimmed. A failing value is kept, not rejected: the
+/// settings screen shows `quill_command_error` and the hook stays disabled until it passes.
+fn apply_quill_command(settings: &mut AppSettings, requested: Option<String>) {
+    if let Some(command) = requested {
+        settings.quill_command = command.trim().to_string();
+    }
+}
+
 fn hold_to_talk_for_shortcut(shortcut: &str, requested: bool) -> bool {
     requested || (cfg!(target_os = "macos") && shortcut == "RightControl")
 }
@@ -765,6 +793,8 @@ struct AppSettings {
     hold_to_talk: bool,
     #[serde(default = "default_recording_shortcut")]
     recording_shortcut: String,
+    #[serde(default = "default_quill_command")]
+    quill_command: String,
 }
 
 impl Default for AppSettings {
@@ -778,6 +808,7 @@ impl Default for AppSettings {
             show_idle_pill: true,
             hold_to_talk: true,
             recording_shortcut: default_recording_shortcut(),
+            quill_command: default_quill_command(),
         }
     }
 }
@@ -795,6 +826,8 @@ struct FrontendSettings {
     hold_to_talk: bool,
     recording_shortcut: String,
     recording_shortcut_error: Option<String>,
+    quill_command: String,
+    quill_command_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,6 +894,8 @@ impl MonitorTransitionDebouncer {
 
 struct AppState {
     worker: Mutex<Option<WorkerClient>>,
+    /// The quill engine. Never locked together with `worker`.
+    quill: Mutex<Option<QuillClient>>,
     settings: std::sync::Mutex<AppSettings>,
     settings_update: Mutex<()>,
     #[cfg(target_os = "macos")]
@@ -1092,6 +1127,8 @@ fn frontend_settings_from(settings: &AppSettings) -> FrontendSettings {
         ),
         recording_shortcut: settings.recording_shortcut.clone(),
         recording_shortcut_error: None,
+        quill_command: settings.quill_command.clone(),
+        quill_command_error: None,
     }
 }
 
@@ -1112,6 +1149,8 @@ fn frontend_settings_with_runtime(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = state;
+    frontend.quill_command_error =
+        quill_client::validate_quill_command(&settings.quill_command, &NativeFs).err();
     Ok(frontend)
 }
 
@@ -1537,6 +1576,7 @@ async fn app_save_settings(
     show_idle_pill: Option<bool>,
     hold_to_talk: Option<bool>,
     recording_shortcut: Option<String>,
+    quill_command: Option<String>,
 ) -> Result<FrontendSettings, String> {
     let _update = state.settings_update.lock().await;
     let shortcut_requested = recording_shortcut.is_some();
@@ -1580,6 +1620,7 @@ async fn app_save_settings(
             }
             current.recording_shortcut = shortcut;
         }
+        apply_quill_command(&mut current, quill_command);
         current.hold_to_talk =
             hold_to_talk_for_shortcut(&current.recording_shortcut, current.hold_to_talk);
         current.refine_enabled =
@@ -1619,6 +1660,209 @@ async fn app_save_settings(
     }
 
     frontend_settings_with_runtime(&state, &updated)
+}
+
+/// What a quill command needs from the app: the configured command and the home directory.
+/// `HOME` is read here, at the command entry point, and nowhere else.
+struct QuillRuntime {
+    command: String,
+    home: Option<PathBuf>,
+}
+
+impl QuillRuntime {
+    fn from_state(state: &AppState) -> Result<Self, QuillCommandError> {
+        let command = state
+            .settings
+            .lock()
+            .map_err(|_| QuillCommandError::transport("Failed to lock settings"))?
+            .quill_command
+            .clone();
+        Ok(Self {
+            command,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        })
+    }
+
+    fn env(&self) -> QuillEnv<'_> {
+        QuillEnv {
+            fs: &NativeFs,
+            home: self.home.as_deref(),
+            timeout: QUILL_REQUEST_TIMEOUT,
+            spawn_timeout: QUILL_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+type QuillFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, QuillCommandError>> + Send + 'a>>;
+
+/// The one entry every quill command goes through. It builds the runtime from app state
+/// (the configured command and `HOME`) and hands the quill slot, the command and the
+/// environment to `f`. `quill_client::lease_quill` inside `f` does the rest: `busy` when
+/// the slot is taken, revalidation of the command, a respawn after a change or a
+/// transport error. It never touches `state.worker`.
+#[cfg(target_os = "macos")]
+async fn with_quill<T>(
+    state: &AppState,
+    f: impl for<'a> FnOnce(&'a Mutex<Option<QuillClient>>, &'a str, &'a QuillEnv<'a>) -> QuillFuture<'a, T>,
+) -> Result<T, QuillCommandError> {
+    let runtime = QuillRuntime::from_state(state)?;
+    let env = runtime.env();
+    f(&state.quill, &runtime.command, &env).await
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quill_unsupported() -> QuillCommandError {
+    QuillCommandError::new(
+        quill_client::QuillErrorCode::Disabled,
+        "Quill rewriting is only available on macOS.",
+    )
+}
+
+/// Rewrites the focused selection in place. `quill` is held from before the selection is
+/// read until `outcome` is reported; the worker mutex is never involved.
+#[tauri::command]
+async fn quill_rewrite_selection(
+    state: State<'_, Arc<AppState>>,
+    mode: String,
+    pressed_at_ms: u64,
+) -> Result<QuillRewriteSelectionResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(async move {
+                quill_client::run_rewrite_selection(
+                    slot,
+                    command,
+                    env,
+                    &mut quill_client::NativeHost,
+                    &mode,
+                    pressed_at_ms,
+                )
+                .await
+            })
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, mode, pressed_at_ms);
+        Err(quill_unsupported())
+    }
+}
+
+#[tauri::command]
+async fn quill_rewrite_text(
+    state: State<'_, Arc<AppState>>,
+    text: String,
+    mode: String,
+    surface: String,
+    source_app: Option<String>,
+) -> Result<QuillRewriteTextResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        let args = quill_client::QuillRewriteTextArgs {
+            text,
+            mode,
+            surface,
+            source_app,
+        };
+        with_quill(&state, |slot, command, env| {
+            Box::pin(quill_client::run_rewrite_text(
+                slot,
+                command,
+                env,
+                &quill_client::NativeHost,
+                args,
+            ))
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, text, mode, surface, source_app);
+        Err(quill_unsupported())
+    }
+}
+
+#[tauri::command]
+async fn quill_revert(
+    state: State<'_, Arc<AppState>>,
+    rewrite_id: String,
+    delivered: Option<String>,
+) -> Result<QuillRevertResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(async move {
+                quill_client::run_revert(
+                    slot,
+                    command,
+                    env,
+                    &mut quill_client::NativeHost,
+                    &rewrite_id,
+                    delivered.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, rewrite_id, delivered);
+        Err(quill_unsupported())
+    }
+}
+
+#[tauri::command]
+async fn quill_report_outcome(
+    state: State<'_, Arc<AppState>>,
+    rewrite_id: String,
+    delivered: String,
+    reverted_via: Option<String>,
+) -> Result<QuillReportOutcomeResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(async move {
+                quill_client::run_report_outcome(
+                    slot,
+                    command,
+                    env,
+                    &rewrite_id,
+                    &delivered,
+                    reverted_via.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, rewrite_id, delivered, reverted_via);
+        Err(quill_unsupported())
+    }
+}
+
+#[tauri::command]
+async fn quill_list_modes(
+    state: State<'_, Arc<AppState>>,
+) -> Result<QuillListModesResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(quill_client::run_list_modes(slot, command, env))
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &state;
+        Err(quill_unsupported())
+    }
 }
 
 #[tauri::command]
@@ -2140,6 +2384,7 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
 pub fn run() {
     let app_state = Arc::new(AppState {
         worker: Mutex::new(None),
+        quill: Mutex::new(None),
         settings: std::sync::Mutex::new(AppSettings::default()),
         settings_update: Mutex::new(()),
         #[cfg(target_os = "macos")]
@@ -2196,6 +2441,32 @@ pub fn run() {
                     .lock()
                     .map_err(|_| anyhow!("Failed to lock settings during setup"))?;
                 *settings = loaded;
+            }
+
+            // There is no enable setting yet, so nothing is enabled at setup and the client
+            // starts on the first command; the setting replaces `false` later.
+            let quill_validation = {
+                let command = state
+                    .settings
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock settings during setup"))?
+                    .quill_command
+                    .clone();
+                quill_client::validate_quill_command(&command, &NativeFs)
+            };
+            if quill_client::quill_should_spawn_at_setup(false, &quill_validation) {
+                let quill_state = state.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let Ok(runtime) = QuillRuntime::from_state(&quill_state) else {
+                        return;
+                    };
+                    if let Err(error) =
+                        quill_client::spawn_into_slot(&quill_state.quill, &runtime.command, &runtime.env())
+                            .await
+                    {
+                        debug_log_line("quill", &quill_client::quill_event_line("setup_spawn_failed", error.code));
+                    }
+                });
             }
 
             if let Err(e) = setup_tray(app) {
@@ -2289,6 +2560,11 @@ pub fn run() {
             app_get_settings,
             app_get_openai_api_key,
             app_save_settings,
+            quill_rewrite_selection,
+            quill_rewrite_text,
+            quill_revert,
+            quill_report_outcome,
+            quill_list_modes,
             worker_ping,
             worker_list_models,
             worker_start_session,
@@ -2661,5 +2937,162 @@ mod tests {
                 .iter()
                 .all(|placement| *placement == expected));
         }
+    }
+
+    // ---- quill settings ---------------------------------------------------------------
+
+    fn quill_test_state(settings: AppSettings) -> AppState {
+        AppState {
+            worker: Mutex::new(None),
+            quill: Mutex::new(None),
+            settings: std::sync::Mutex::new(settings),
+            settings_update: Mutex::new(()),
+            #[cfg(target_os = "macos")]
+            recording_shortcut: std::sync::Mutex::new(recording_shortcut::Runtime::default()),
+            overlay_anchor: std::sync::Mutex::new(None),
+            overlay_layout: std::sync::Mutex::new(None),
+            overlay_layout_locked: AtomicBool::new(false),
+        }
+    }
+
+    fn quill_test_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("openwhisper-quill-settings-{}", Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    fn quill_test_file(dir: &std::path::Path, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let file = dir.join("quill");
+        fs::write(&file, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    #[test]
+    fn quill_command_settings_missing_field_loads_the_default() {
+        let settings: AppSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(settings.quill_command, default_quill_command());
+        assert_eq!(AppSettings::default().quill_command, default_quill_command());
+
+        assert_eq!(
+            default_quill_command_for(Some(std::ffi::OsString::from("/Users/me"))),
+            "/Users/me/.local/bin/quill"
+        );
+        assert_eq!(default_quill_command_for(None), "");
+        assert_eq!(default_quill_command_for(Some(std::ffi::OsString::new())), "");
+    }
+
+    #[test]
+    fn quill_command_settings_round_trip_keeps_the_value() {
+        let settings = AppSettings {
+            quill_command: "/opt/tools/quill".to_string(),
+            ..AppSettings::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["quillCommand"], "/opt/tools/quill");
+        let loaded: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.quill_command, "/opt/tools/quill");
+        assert_eq!(
+            serde_json::to_value(frontend_settings_from(&loaded)).unwrap()["quillCommand"],
+            "/opt/tools/quill"
+        );
+    }
+
+    #[test]
+    fn quill_command_settings_failing_value_surfaces_the_validation_string() {
+        let dir = quill_test_dir();
+        let good = quill_test_file(&dir, 0o700);
+        let state = quill_test_state(AppSettings::default());
+
+        let ok = frontend_settings_with_runtime(
+            &state,
+            &AppSettings {
+                quill_command: good.to_string_lossy().to_string(),
+                ..AppSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ok.quill_command_error, None);
+        assert!(serde_json::to_value(&ok).unwrap()["quillCommandError"].is_null());
+
+        let relative = frontend_settings_with_runtime(
+            &state,
+            &AppSettings {
+                quill_command: "quill".to_string(),
+                ..AppSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            relative.quill_command_error.as_deref(),
+            Some("Quill command must be an absolute path.")
+        );
+
+        fs::set_permissions(&good, std::os::unix::fs::PermissionsExt::from_mode(0o770)).unwrap();
+        let writable = frontend_settings_with_runtime(
+            &state,
+            &AppSettings {
+                quill_command: good.to_string_lossy().to_string(),
+                ..AppSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            writable.quill_command_error,
+            Some(format!(
+                "Quill command is group-writable: {}",
+                fs::canonicalize(&good).unwrap().display()
+            ))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quill_command_settings_save_stores_the_trimmed_value_without_rejecting_it() {
+        let mut settings = AppSettings::default();
+        let before = settings.quill_command.clone();
+        apply_quill_command(&mut settings, None);
+        assert_eq!(settings.quill_command, before);
+        apply_quill_command(&mut settings, Some("  /opt/quill  ".to_string()));
+        assert_eq!(settings.quill_command, "/opt/quill");
+        apply_quill_command(&mut settings, Some("not/absolute".to_string()));
+        assert_eq!(settings.quill_command, "not/absolute", "a failing value is stored, not rejected");
+        apply_quill_command(&mut settings, Some("   ".to_string()));
+        assert_eq!(settings.quill_command, "");
+    }
+
+    #[test]
+    fn quill_command_settings_change_alone_keeps_the_live_worker() {
+        let previous = AppSettings::default();
+        let updated = AppSettings {
+            quill_command: "/somewhere/else/quill".to_string(),
+            ..previous.clone()
+        };
+        assert!(!worker_settings_changed(&previous, &updated));
+    }
+
+    #[test]
+    fn quill_command_settings_add_no_other_quill_setting() {
+        let frontend = serde_json::to_value(frontend_settings_from(&AppSettings::default())).unwrap();
+        let mut quill_keys: Vec<&str> = frontend
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.to_lowercase().contains("quill"))
+            .map(String::as_str)
+            .collect();
+        quill_keys.sort_unstable();
+        assert_eq!(quill_keys, ["quillCommand", "quillCommandError"]);
+        let stored = serde_json::to_value(AppSettings::default()).unwrap();
+        let stored_keys: Vec<&str> = stored
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.to_lowercase().contains("quill"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(stored_keys, ["quillCommand"]);
     }
 }

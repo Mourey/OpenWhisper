@@ -246,7 +246,6 @@ struct Anchor {
 }
 
 /// How a rewrite reached the user.
-#[allow(dead_code)] // constructed by the quill commands from the next build step on
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     Inserted,
@@ -480,6 +479,13 @@ fn anchor_after_insertion<P: Platform>(
     (start >= 0).then_some(Anchor { start, len })
 }
 
+/// How the slot's own rewrite reached the user; `None` for any other rewrite id.
+fn slot_delivery<T>(slot: &Option<QuillSlot<T>>, rewrite_id: &str) -> Option<Delivery> {
+    slot.as_ref()
+        .filter(|slot| slot.rewrite_id.as_deref() == Some(rewrite_id))
+        .and_then(|slot| slot.delivered)
+}
+
 fn slot_record_rewrite<T>(
     slot: &mut Option<QuillSlot<T>>,
     rewrite_id: &str,
@@ -545,30 +551,24 @@ fn quill_state() -> std::sync::MutexGuard<'static, Option<QuillSlot<NativeTarget
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// The quill commands call these from the next build step on.
-
 /// Captures the focused element into the quill slot and returns its selected text, or one
 /// of `accessibility_permission`, `no_selection`, `secure_field`, `modifiers_held`,
 /// `too_long`.
-#[allow(dead_code)]
 pub fn quill_read_selection() -> Result<String, &'static str> {
     slot_read_selection(&mut quill_state(), &mut NativePlatform, Instant::now())
 }
 
-#[allow(dead_code)]
 pub fn read_selected_text() -> Result<String, &'static str> {
     quill_read_selection()
 }
 
 /// The application name captured with the quill slot.
-#[allow(dead_code)]
 pub fn quill_source_app() -> Option<String> {
     quill_state().as_ref().and_then(|slot| slot.source_app.clone())
 }
 
 /// Replaces the quill slot's selection with `text`. A Cmd+V insertion returns before the
 /// clipboard is restored, 300 ms later on a detached thread.
-#[allow(dead_code)]
 pub fn replace_selection(text: &str) -> ReplaceReport {
     let (report, restore) = slot_replace_selection(&mut quill_state(), &mut NativePlatform, text);
     if let Some(restore) = restore {
@@ -582,13 +582,16 @@ pub fn replace_selection(text: &str) -> ReplaceReport {
     report
 }
 
+/// How the quill slot's rewrite was delivered, if `rewrite_id` is that rewrite.
+pub fn quill_slot_delivery(rewrite_id: &str) -> Option<Delivery> {
+    slot_delivery(&quill_state(), rewrite_id)
+}
+
 /// Records the rewrite on the quill slot so a later revert can find it.
-#[allow(dead_code)]
 pub fn quill_record_rewrite(rewrite_id: &str, rewritten_text: &str, delivered: Delivery) {
     slot_record_rewrite(&mut quill_state(), rewrite_id, rewritten_text, delivered);
 }
 
-#[allow(dead_code)]
 pub fn revert_at_anchor(rewrite_id: &str, original: &str) -> RevertAtAnchor {
     slot_revert(
         &mut quill_state(),
@@ -1857,6 +1860,16 @@ mod tests {
         platform.accepted = false;
         let outcome = slot_revert(&mut slot, &mut platform, "rw-1", "the original", base);
         assert_eq!(outcome, RevertAtAnchor::Copied);
+    }
+
+    #[test]
+    fn quill_revert_at_anchor_slot_delivery_is_known_only_for_the_slots_own_rewrite() {
+        let (_, mut slot, _) = reverted_fixture();
+        assert_eq!(slot_delivery(&slot, "rw-1"), Some(Delivery::Inserted));
+        assert_eq!(slot_delivery(&slot, "rw-2"), None);
+        slot.as_mut().unwrap().delivered = None;
+        assert_eq!(slot_delivery(&slot, "rw-1"), None);
+        assert_eq!(slot_delivery::<FakeTarget>(&None, "rw-1"), None);
     }
 
     #[test]

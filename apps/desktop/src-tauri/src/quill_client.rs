@@ -4,14 +4,11 @@
 //! The engine types mirror the vendored schema in `contracts/quill` and reject unknown
 //! fields, so a drifting engine fails loudly instead of being half understood.
 
-// The Tauri commands that consume these items are wired in a later build step.
-#![allow(dead_code)]
-
 use crate::jsonl_client::{JsonlChannel, RequestError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -55,12 +52,15 @@ impl QuillMethod {
     }
 }
 
+/// The request envelope as the schema defines it. The client writes requests through
+/// `WorkerRequest`; this typed form exists to check the vendored fixtures.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuillRequest {
     pub id: String,
     pub method: QuillMethod,
-    pub params: Value,
+    pub params: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,6 +250,8 @@ pub enum QuillErrorCode {
 }
 
 impl QuillErrorCode {
+    /// Every code, for the shape tests.
+    #[cfg(test)]
     pub const ALL: [Self; 17] = [
         Self::NotFound,
         Self::BadRequest,
@@ -772,7 +774,7 @@ pub async fn lease_quill<'a>(
     let configured = Path::new(raw_command);
     let reusable = guard
         .as_ref()
-        .is_some_and(|client| client.command == configured && client.canonical == canonical);
+        .is_some_and(|client| client.command() == configured && client.canonical == canonical);
     let client = if reusable {
         guard.take()
     } else {
@@ -782,6 +784,474 @@ pub async fn lease_quill<'a>(
         Some(client)
     };
     Ok(QuillLease { slot: guard, client })
+}
+
+// ---- command flows (R9.4, R19.1) -----------------------------------------------------
+
+/// Everything the flows need from the machine around them: the selection and the
+/// clipboard, the clock and the debug log. The real one is `NativeHost`; tests use a fake.
+/// Nothing a host logs may carry selection, rewrite or engine text.
+pub trait QuillHost: Send + Sync {
+    /// Captures the focused element and reads its selection, or says why it cannot.
+    fn read_selection(&mut self) -> impl Future<Output = Result<String, QuillErrorCode>> + Send;
+    /// The application name captured with the selection.
+    fn source_app(&mut self) -> Option<String>;
+    /// Writes `text` over the captured selection.
+    fn replace_selection(&mut self, text: &str) -> impl Future<Output = HostReplace> + Send;
+    /// Remembers the rewrite so a later revert can act on it.
+    fn record_rewrite(&mut self, rewrite_id: &str, text: &str, delivered: Delivered);
+    /// How `rewrite_id` was delivered, if it is the rewrite the host still holds.
+    fn slot_delivery(&mut self, rewrite_id: &str) -> Option<Delivered>;
+    /// Writes `original` over the rewrite in place; false when it could not.
+    fn revert_at_anchor(&mut self, rewrite_id: &str, original: &str) -> impl Future<Output = bool> + Send;
+    fn copy_to_clipboard(&mut self, text: &str) -> bool;
+    /// Milliseconds since the Unix epoch, the unit of `pressed_at_ms`.
+    fn now_ms(&self) -> u64;
+    /// Writes one line to `debug.log`.
+    fn log(&self, message: &str);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostReplace {
+    pub inserted: bool,
+    pub anchored: bool,
+    pub clipboard_replaced: bool,
+}
+
+/// How a hotkey rewrite ended, for the `[quill]` timing line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingResult {
+    Inserted,
+    Copied,
+    Failed,
+    Refused,
+}
+
+impl TimingResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Copied => "copied",
+            Self::Failed => "failed",
+            Self::Refused => "refused",
+        }
+    }
+
+    fn of(result: &Result<QuillRewriteSelectionResult, QuillCommandError>) -> Self {
+        match result {
+            Ok(_) => Self::Inserted,
+            Err(error) => match error.code {
+                QuillErrorCode::TargetChanged => Self::Copied,
+                QuillErrorCode::NoSelection
+                | QuillErrorCode::SecureField
+                | QuillErrorCode::TooLong
+                | QuillErrorCode::AccessibilityPermission
+                | QuillErrorCode::ModifiersHeld => Self::Refused,
+                _ => Self::Failed,
+            },
+        }
+    }
+}
+
+/// The text of the `[quill]` debug-log line. `end_to_end_ms` counts from the first press
+/// (the frontend's clock) to the inserter's return and saturates at 0. The mode id is the
+/// only caller-supplied text, so it is cut to one safe token.
+pub fn quill_timing_line(
+    mode: &str,
+    pressed_at_ms: u64,
+    inserted_at_ms: u64,
+    engine_ms: u64,
+    result: TimingResult,
+) -> String {
+    let mode: String = mode
+        .chars()
+        .take(64)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    format!(
+        "surface=hotkey mode={mode} end_to_end_ms={} engine_ms={engine_ms} result={}",
+        inserted_at_ms.saturating_sub(pressed_at_ms),
+        result.as_str()
+    )
+}
+
+/// A diagnostic line that names an event and an error code and nothing else.
+pub fn quill_event_line(event: &str, code: QuillErrorCode) -> String {
+    format!("quill {event} code={}", code.as_str())
+}
+
+/// True only when the hook is enabled and its command passed validation.
+pub fn quill_should_spawn_at_setup(enabled: bool, validation: &Result<PathBuf, String>) -> bool {
+    enabled && validation.is_ok()
+}
+
+/// Starts the client into the slot ahead of the first command, without waiting if the
+/// slot is taken.
+pub async fn spawn_into_slot(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+) -> Result<(), QuillCommandError> {
+    lease_quill(slot, raw_command, env).await.map(drop)
+}
+
+fn refusal_message(code: QuillErrorCode) -> &'static str {
+    match code {
+        QuillErrorCode::NoSelection => "No text is selected.",
+        QuillErrorCode::SecureField => "The focused field is a secure field.",
+        QuillErrorCode::TooLong => "The selection is longer than 8,000 characters.",
+        QuillErrorCode::AccessibilityPermission => "Accessibility permission is required.",
+        QuillErrorCode::ModifiersHeld => "Release the modifier keys and try again.",
+        _ => "The selection could not be read.",
+    }
+}
+
+fn bad_request(message: &str) -> QuillCommandError {
+    QuillCommandError::new(QuillErrorCode::BadRequest, message)
+}
+
+fn parse_delivered(value: &str) -> Result<Delivered, QuillCommandError> {
+    match value {
+        "inserted" => Ok(Delivered::Inserted),
+        "copied" => Ok(Delivered::Copied),
+        "failed" => Ok(Delivered::Failed),
+        _ => Err(bad_request("delivered must be inserted, copied or failed.")),
+    }
+}
+
+fn parse_reverted_via(value: &str) -> Result<RevertedVia, QuillCommandError> {
+    match value {
+        "inserted" => Ok(RevertedVia::Inserted),
+        "copied" => Ok(RevertedVia::Copied),
+        _ => Err(bad_request("revertedVia must be inserted or copied.")),
+    }
+}
+
+/// Tells quill how a rewrite was delivered. The text is already with the user, so a
+/// failure is logged by code and otherwise ignored.
+async fn send_outcome<H: QuillHost>(
+    client: &mut QuillClient,
+    host: &H,
+    rewrite_id: &str,
+    delivered: Delivered,
+    reverted_via: Option<RevertedVia>,
+) {
+    let params = OutcomeParams {
+        rewrite_id: rewrite_id.to_string(),
+        delivered,
+        reverted_via,
+    };
+    if let Err(error) = client.request_typed::<_, OutcomeResult>(QuillMethod::Outcome, &params).await {
+        host.log(&quill_event_line("outcome_failed", error.code));
+    }
+}
+
+#[derive(Default)]
+struct SelectionTiming {
+    engine_ms: u64,
+    inserted_at_ms: Option<u64>,
+}
+
+/// The hotkey rewrite: read the selection, rewrite it, write it back, report `outcome`.
+/// Holds the slot from before the read until `outcome` returns, and writes exactly one
+/// timing line however the call ends.
+pub async fn run_rewrite_selection<H: QuillHost>(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+    host: &mut H,
+    mode: &str,
+    pressed_at_ms: u64,
+) -> Result<QuillRewriteSelectionResult, QuillCommandError> {
+    let mut timing = SelectionTiming::default();
+    let result = match lease_quill(slot, raw_command, env).await {
+        Ok(mut lease) => rewrite_selection(lease.client(), host, mode, pressed_at_ms, &mut timing).await,
+        Err(error) => Err(error),
+    };
+    let inserted_at_ms = timing.inserted_at_ms.unwrap_or_else(|| host.now_ms());
+    host.log(&quill_timing_line(
+        mode,
+        pressed_at_ms,
+        inserted_at_ms,
+        timing.engine_ms,
+        TimingResult::of(&result),
+    ));
+    result
+}
+
+async fn rewrite_selection<H: QuillHost>(
+    client: &mut QuillClient,
+    host: &mut H,
+    mode: &str,
+    pressed_at_ms: u64,
+    timing: &mut SelectionTiming,
+) -> Result<QuillRewriteSelectionResult, QuillCommandError> {
+    let text = host
+        .read_selection()
+        .await
+        .map_err(|code| QuillCommandError::new(code, refusal_message(code)))?;
+    let params = RewriteParams {
+        text,
+        mode: mode.to_string(),
+        surface: Surface::Hotkey,
+        source_app: host.source_app(),
+        target_model: None,
+    };
+
+    let started_ms = host.now_ms();
+    let rewritten = client.request_typed::<_, RewriteResult>(QuillMethod::Rewrite, &params).await;
+    timing.engine_ms = host.now_ms().saturating_sub(started_ms);
+    let rewritten = rewritten?;
+
+    let replaced = host.replace_selection(&rewritten.text).await;
+    let inserted_at_ms = host.now_ms();
+    timing.inserted_at_ms = Some(inserted_at_ms);
+
+    let delivered = if replaced.inserted {
+        Delivered::Inserted
+    } else if host.copy_to_clipboard(&rewritten.text) {
+        Delivered::Copied
+    } else {
+        host.log(&quill_event_line("clipboard_copy_failed", QuillErrorCode::InternalError));
+        Delivered::Failed
+    };
+    host.record_rewrite(&rewritten.rewrite_id, &rewritten.text, delivered);
+    send_outcome(client, host, &rewritten.rewrite_id, delivered, None).await;
+
+    if !replaced.inserted {
+        let message = if delivered == Delivered::Copied {
+            "The text field changed before the rewrite could be inserted; it was copied to the clipboard."
+        } else {
+            "The text field changed before the rewrite could be inserted, and it could not be copied."
+        };
+        return Err(QuillCommandError::new(QuillErrorCode::TargetChanged, message));
+    }
+    Ok(QuillRewriteSelectionResult {
+        rewrite_id: rewritten.rewrite_id,
+        mode: rewritten.mode,
+        model: rewritten.model,
+        latency_ms: rewritten.latency_ms,
+        end_to_end_ms: inserted_at_ms.saturating_sub(pressed_at_ms),
+        anchored: replaced.anchored,
+        clipboard_replaced: replaced.clipboard_replaced,
+    })
+}
+
+/// A rewrite for the dictation pill: nothing is inserted, the caller delivers the text.
+pub async fn run_rewrite_text<H: QuillHost>(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+    host: &H,
+    args: QuillRewriteTextArgs,
+) -> Result<QuillRewriteTextResult, QuillCommandError> {
+    if args.surface != "pill" {
+        return Err(bad_request("quill_rewrite_text only accepts the pill surface."));
+    }
+    let params = RewriteParams {
+        text: args.text,
+        mode: args.mode,
+        surface: Surface::Pill,
+        source_app: args.source_app,
+        target_model: None,
+    };
+    let mut lease = lease_quill(slot, raw_command, env).await?;
+    let result = lease
+        .client()
+        .request_typed::<_, RewriteResult>(QuillMethod::Rewrite, &params)
+        .await;
+    match result {
+        Ok(rewritten) => Ok(QuillRewriteTextResult {
+            rewrite_id: rewritten.rewrite_id,
+            text: rewritten.text,
+            mode: rewritten.mode,
+            model: rewritten.model,
+            latency_ms: rewritten.latency_ms,
+        }),
+        Err(error) => {
+            host.log(&quill_event_line("rewrite_text_failed", error.code));
+            Err(error)
+        }
+    }
+}
+
+/// Reverts a rewrite: quill gives the original back, the host writes it over the rewrite
+/// when it still can and copies it otherwise, then `outcome` records how. `delivered` is
+/// how the rewrite itself was delivered; the host knows it for the rewrite it holds,
+/// anything else needs the caller's value.
+pub async fn run_revert<H: QuillHost>(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+    host: &mut H,
+    rewrite_id: &str,
+    delivered: Option<&str>,
+) -> Result<QuillRevertResult, QuillCommandError> {
+    let supplied = delivered.map(parse_delivered).transpose()?;
+    let held = host.slot_delivery(rewrite_id);
+    let delivered = held
+        .or(supplied)
+        .ok_or_else(|| bad_request("delivered is required to revert a rewrite that was not inserted by the hotkey."))?;
+
+    let mut lease = lease_quill(slot, raw_command, env).await?;
+    let client = lease.client();
+    let original: RevertResult = client
+        .request_typed(
+            QuillMethod::Revert,
+            &RevertParams {
+                rewrite_id: rewrite_id.to_string(),
+            },
+        )
+        .await?;
+
+    let in_place = held.is_some() && host.revert_at_anchor(rewrite_id, &original.text).await;
+    let (reverted_via, how) = if in_place {
+        (RevertedVia::Inserted, RevertDelivered::Inserted)
+    } else if host.copy_to_clipboard(&original.text) {
+        (RevertedVia::Copied, RevertDelivered::Copied)
+    } else {
+        host.log(&quill_event_line("clipboard_copy_failed", QuillErrorCode::InternalError));
+        return Err(QuillCommandError::new(
+            QuillErrorCode::InternalError,
+            "The original text could not be copied to the clipboard.",
+        ));
+    };
+    send_outcome(client, host, rewrite_id, delivered, Some(reverted_via)).await;
+    Ok(QuillRevertResult { delivered: how })
+}
+
+/// Reports how a dictation rewrite was delivered.
+pub async fn run_report_outcome(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+    rewrite_id: &str,
+    delivered: &str,
+    reverted_via: Option<&str>,
+) -> Result<QuillReportOutcomeResult, QuillCommandError> {
+    let params = OutcomeParams {
+        rewrite_id: rewrite_id.to_string(),
+        delivered: parse_delivered(delivered)?,
+        reverted_via: reverted_via.map(parse_reverted_via).transpose()?,
+    };
+    let mut lease = lease_quill(slot, raw_command, env).await?;
+    lease
+        .client()
+        .request_typed::<_, OutcomeResult>(QuillMethod::Outcome, &params)
+        .await?;
+    Ok(QuillReportOutcomeResult {})
+}
+
+pub async fn run_list_modes(
+    slot: &Mutex<Option<QuillClient>>,
+    raw_command: &str,
+    env: &QuillEnv<'_>,
+) -> Result<QuillListModesResult, QuillCommandError> {
+    let mut lease = lease_quill(slot, raw_command, env).await?;
+    let result: ListModesResult = lease
+        .client()
+        .request_typed(QuillMethod::ListModes, &ListModesParams {})
+        .await?;
+    Ok(QuillListModesResult {
+        modes: result.modes.into_iter().map(QuillModeInfo::from).collect(),
+    })
+}
+
+/// The real selection, clipboard, clock and debug log (macOS only; other targets answer
+/// `disabled` before reaching a host).
+#[cfg(target_os = "macos")]
+pub struct NativeHost;
+
+#[cfg(target_os = "macos")]
+impl NativeHost {
+    async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, fallback: T) -> T {
+        tokio::task::spawn_blocking(work).await.unwrap_or(fallback)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl QuillHost for NativeHost {
+    fn read_selection(&mut self) -> impl Future<Output = Result<String, QuillErrorCode>> + Send {
+        use crate::macos_text_inserter::read_selected_text;
+        async {
+            let read = Self::blocking(read_selected_text, Err("no_selection")).await;
+            read.map_err(|reason| match reason {
+                "accessibility_permission" => QuillErrorCode::AccessibilityPermission,
+                "secure_field" => QuillErrorCode::SecureField,
+                "modifiers_held" => QuillErrorCode::ModifiersHeld,
+                "too_long" => QuillErrorCode::TooLong,
+                _ => QuillErrorCode::NoSelection,
+            })
+        }
+    }
+
+    fn source_app(&mut self) -> Option<String> {
+        crate::macos_text_inserter::quill_source_app()
+    }
+
+    fn replace_selection(&mut self, text: &str) -> impl Future<Output = HostReplace> + Send {
+        let text = text.to_string();
+        async move {
+            let failed = HostReplace {
+                inserted: false,
+                anchored: false,
+                clipboard_replaced: false,
+            };
+            let report = Self::blocking(
+                move || Some(crate::macos_text_inserter::replace_selection(&text)),
+                None,
+            )
+            .await;
+            report.map_or(failed, |report| HostReplace {
+                inserted: report.paste.pasted,
+                anchored: report.anchored,
+                clipboard_replaced: report.clipboard_replaced,
+            })
+        }
+    }
+
+    fn record_rewrite(&mut self, rewrite_id: &str, text: &str, delivered: Delivered) {
+        use crate::macos_text_inserter::Delivery;
+        let delivery = if delivered == Delivered::Inserted {
+            Delivery::Inserted
+        } else {
+            Delivery::Copied
+        };
+        crate::macos_text_inserter::quill_record_rewrite(rewrite_id, text, delivery);
+    }
+
+    fn slot_delivery(&mut self, rewrite_id: &str) -> Option<Delivered> {
+        use crate::macos_text_inserter::Delivery;
+        crate::macos_text_inserter::quill_slot_delivery(rewrite_id).map(|delivery| match delivery {
+            Delivery::Inserted => Delivered::Inserted,
+            Delivery::Copied => Delivered::Copied,
+        })
+    }
+
+    fn revert_at_anchor(&mut self, rewrite_id: &str, original: &str) -> impl Future<Output = bool> + Send {
+        use crate::macos_text_inserter::{revert_at_anchor, RevertAtAnchor};
+        let (rewrite_id, original) = (rewrite_id.to_string(), original.to_string());
+        async move {
+            Self::blocking(move || revert_at_anchor(&rewrite_id, &original), RevertAtAnchor::Copied).await
+                == RevertAtAnchor::Inserted
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+            .is_ok()
+    }
+
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn log(&self, message: &str) {
+        crate::debug_log_line("quill", message);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1957,5 +2427,709 @@ esac"#;
         for other in ["printed", "Busy", "BUSY", "", "ok", "invalid_command"] {
             assert!(serde_json::from_value::<QuillErrorCode>(json!(other)).is_err(), "{other:?}");
         }
+    }
+
+    // ---- quill_flow_ / quill_timing_line_ / quill_should_spawn_at_setup_ ------------
+
+    /// Stands in for the selection port, the clipboard, the clock and the log.
+    struct FakeHost {
+        selection: Result<String, QuillErrorCode>,
+        source_app: Option<String>,
+        replace: HostReplace,
+        slot_delivery: Option<Delivered>,
+        revert_inserts: bool,
+        copy_ok: bool,
+        clock: std::sync::Mutex<std::collections::VecDeque<u64>>,
+        calls: Vec<String>,
+        copies: Vec<String>,
+        records: Vec<(String, String, Delivered)>,
+        logs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            Self {
+                selection: Ok("selected".to_string()),
+                source_app: Some("Notes".to_string()),
+                replace: HostReplace {
+                    inserted: true,
+                    anchored: true,
+                    clipboard_replaced: false,
+                },
+                slot_delivery: None,
+                revert_inserts: true,
+                copy_ok: true,
+                clock: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                calls: Vec::new(),
+                copies: Vec::new(),
+                records: Vec::new(),
+                logs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_clock(mut self, values: &[u64]) -> Self {
+            self.clock = std::sync::Mutex::new(values.iter().copied().collect());
+            self
+        }
+
+        fn logs(&self) -> Vec<String> {
+            self.logs.lock().unwrap().clone()
+        }
+
+        fn timing_lines(&self) -> Vec<String> {
+            self.logs().into_iter().filter(|line| line.starts_with("surface=hotkey ")).collect()
+        }
+    }
+
+    impl QuillHost for FakeHost {
+        fn read_selection(&mut self) -> impl std::future::Future<Output = Result<String, QuillErrorCode>> + Send {
+            self.calls.push("read".to_string());
+            let result = self.selection.clone();
+            async move { result }
+        }
+
+        fn source_app(&mut self) -> Option<String> {
+            self.source_app.clone()
+        }
+
+        fn replace_selection(&mut self, text: &str) -> impl std::future::Future<Output = HostReplace> + Send {
+            self.calls.push(format!("replace:{text}"));
+            let report = self.replace;
+            async move { report }
+        }
+
+        fn record_rewrite(&mut self, rewrite_id: &str, text: &str, delivered: Delivered) {
+            self.records.push((rewrite_id.to_string(), text.to_string(), delivered));
+        }
+
+        fn slot_delivery(&mut self, _rewrite_id: &str) -> Option<Delivered> {
+            self.slot_delivery
+        }
+
+        fn revert_at_anchor(
+            &mut self,
+            rewrite_id: &str,
+            original: &str,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            self.calls.push(format!("revert:{rewrite_id}:{original}"));
+            let inserted = self.revert_inserts;
+            async move { inserted }
+        }
+
+        fn copy_to_clipboard(&mut self, text: &str) -> bool {
+            self.copies.push(text.to_string());
+            self.copy_ok
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.clock.lock().unwrap().pop_front().unwrap_or(5_000_000)
+        }
+
+        fn log(&self, message: &str) {
+            self.logs.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    const FLOW_BODY: &str = r#"case "$method" in
+  rewrite) reply '{"rewrite_id":"rw-1","text":"REWRITTEN","mode":"task-claude","model":"test/model","latency_ms":12}';;
+  outcome) reply '{}';;
+  revert) reply '{"text":"ORIGINAL"}';;
+  list_modes) reply "$(modes only)";;
+esac"#;
+
+    fn sent(fake: &FakeQuill) -> Vec<Value> {
+        fake.lines("requests")
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn methods(fake: &FakeQuill) -> Vec<String> {
+        sent(fake)
+            .iter()
+            .map(|request| request["method"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn params_of(fake: &FakeQuill, method: &str) -> Vec<Value> {
+        sent(fake)
+            .into_iter()
+            .filter(|request| request["method"] == method)
+            .map(|request| request["params"].clone())
+            .collect()
+    }
+
+    // quill_flow_: rewrite_selection
+
+    #[tokio::test]
+    async fn quill_flow_read_refusals_return_their_code_and_send_no_rewrite() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        for code in [
+            QuillErrorCode::NoSelection,
+            QuillErrorCode::SecureField,
+            QuillErrorCode::TooLong,
+            QuillErrorCode::AccessibilityPermission,
+            QuillErrorCode::ModifiersHeld,
+        ] {
+            let mut host = FakeHost::new();
+            host.selection = Err(code);
+            let error = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert!(!error.message.is_empty());
+            assert_eq!(host.calls, ["read"], "nothing is replaced after a refusal");
+            assert!(host.copies.is_empty() && host.records.is_empty());
+        }
+        assert_eq!(methods(&fake), ["ping"], "no rewrite request for a refused selection");
+    }
+
+    #[tokio::test]
+    async fn quill_flow_success_sends_rewrite_then_outcome_inserted() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new().with_clock(&[10_600, 10_900, 10_950]);
+        host.replace.clipboard_replaced = true;
+
+        let result = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 10_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            QuillRewriteSelectionResult {
+                rewrite_id: "rw-1".into(),
+                mode: "task-claude".into(),
+                model: "test/model".into(),
+                latency_ms: 12,
+                end_to_end_ms: 950,
+                anchored: true,
+                clipboard_replaced: true,
+            }
+        );
+        assert_eq!(methods(&fake), ["ping", "rewrite", "outcome"]);
+        assert_eq!(
+            params_of(&fake, "rewrite"),
+            [json!({"text": "selected", "mode": "task-claude", "surface": "hotkey", "source_app": "Notes"})]
+        );
+        assert_eq!(params_of(&fake, "outcome"), [json!({"rewrite_id": "rw-1", "delivered": "inserted"})]);
+        assert_eq!(host.calls, ["read", "replace:REWRITTEN"]);
+        assert_eq!(host.records, [("rw-1".to_string(), "REWRITTEN".to_string(), Delivered::Inserted)]);
+        assert!(host.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quill_flow_target_change_copies_the_rewrite_reports_copied_and_returns_target_changed() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+        host.replace = HostReplace {
+            inserted: false,
+            anchored: false,
+            clipboard_replaced: false,
+        };
+
+        let error = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::TargetChanged);
+        assert_eq!(host.copies, ["REWRITTEN"]);
+        assert_eq!(methods(&fake), ["ping", "rewrite", "outcome"]);
+        assert_eq!(params_of(&fake, "outcome"), [json!({"rewrite_id": "rw-1", "delivered": "copied"})]);
+        assert_eq!(host.records, [("rw-1".to_string(), "REWRITTEN".to_string(), Delivered::Copied)]);
+    }
+
+    #[tokio::test]
+    async fn quill_flow_invalid_command_is_disabled_with_no_spawn_and_no_read() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+
+        let error = run_rewrite_selection(&slot, "quill", &env, &mut host, "task-claude", 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::Disabled);
+        assert_eq!(error.message, "Quill command must be an absolute path.");
+        assert_eq!(fake.spawn_count(), 0);
+        assert!(host.calls.is_empty(), "the selection is not read when the hook is disabled");
+    }
+
+    #[tokio::test]
+    async fn quill_flow_engine_error_inserts_nothing_and_sends_no_outcome() {
+        let body = r#"case "$method" in rewrite) fail upstream_error "engine said no";; esac"#;
+        let fake = FakeQuill::new(body);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+
+        let error = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::UpstreamError);
+        assert_eq!(error.message, "engine said no");
+        assert_eq!(host.calls, ["read"]);
+        assert!(host.copies.is_empty() && host.records.is_empty());
+        assert_eq!(methods(&fake), ["ping", "rewrite"]);
+    }
+
+    #[tokio::test]
+    async fn quill_flow_outcome_failure_after_insertion_is_logged_by_code_only() {
+        let body = r#"case "$method" in
+  rewrite) reply '{"rewrite_id":"rw-1","text":"REWRITTEN","mode":"task-claude","model":"m","latency_ms":1}';;
+  outcome) fail internal_error "secret engine text";;
+esac"#;
+        let fake = FakeQuill::new(body);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+
+        let result = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0).await;
+
+        assert!(result.is_ok(), "the insertion already happened");
+        assert!(host.logs().contains(&"quill outcome_failed code=internal_error".to_string()));
+        assert!(host.logs().iter().all(|line| !line.contains("secret engine text")));
+    }
+
+    #[tokio::test]
+    async fn quill_flow_busy_slot_returns_busy_without_reading_the_selection() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let _held = slot.lock().await;
+        let mut host = FakeHost::new();
+
+        let error = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::Busy);
+        assert!(host.calls.is_empty());
+    }
+
+    // quill_flow_: rewrite_text
+
+    fn text_args(surface: &str) -> QuillRewriteTextArgs {
+        QuillRewriteTextArgs {
+            text: "dictated words".into(),
+            mode: "dictation-clean".into(),
+            surface: surface.into(),
+            source_app: Some("Slack".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn quill_flow_rewrite_text_accepts_only_the_pill_surface_and_inserts_nothing() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let host = FakeHost::new();
+
+        for surface in ["hotkey", "cli", "", "PILL"] {
+            let error = run_rewrite_text(&slot, fake.command(), &env, &host, text_args(surface))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, QuillErrorCode::BadRequest, "{surface:?}");
+        }
+        assert_eq!(fake.spawn_count(), 0, "a refused surface makes no request and no spawn");
+
+        let result = run_rewrite_text(&slot, fake.command(), &env, &host, text_args("pill"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            QuillRewriteTextResult {
+                rewrite_id: "rw-1".into(),
+                text: "REWRITTEN".into(),
+                mode: "task-claude".into(),
+                model: "test/model".into(),
+                latency_ms: 12,
+            }
+        );
+        assert_eq!(
+            params_of(&fake, "rewrite"),
+            [json!({"text": "dictated words", "mode": "dictation-clean", "surface": "pill", "source_app": "Slack"})]
+        );
+        let mut absent = text_args("pill");
+        absent.source_app = None;
+        run_rewrite_text(&slot, fake.command(), &env, &host, absent).await.unwrap();
+        assert_eq!(params_of(&fake, "rewrite")[1]["source_app"], Value::Null);
+    }
+
+    // quill_flow_: revert
+
+    #[tokio::test]
+    async fn quill_flow_revert_with_an_anchor_reports_reverted_via_inserted() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+        host.slot_delivery = Some(Delivered::Inserted);
+
+        let result = run_revert(&slot, fake.command(), &env, &mut host, "rw-1", None).await.unwrap();
+
+        assert_eq!(result, QuillRevertResult { delivered: RevertDelivered::Inserted });
+        assert_eq!(methods(&fake), ["ping", "revert", "outcome"]);
+        assert_eq!(params_of(&fake, "revert"), [json!({"rewrite_id": "rw-1"})]);
+        assert_eq!(
+            params_of(&fake, "outcome"),
+            [json!({"rewrite_id": "rw-1", "delivered": "inserted", "reverted_via": "inserted"})]
+        );
+        assert_eq!(host.calls, ["revert:rw-1:ORIGINAL"]);
+        assert!(host.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quill_flow_revert_that_cannot_act_in_place_copies_the_original() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+
+        // The slot's own rewrite, but the anchor no longer holds.
+        let mut host = FakeHost::new();
+        host.slot_delivery = Some(Delivered::Copied);
+        host.revert_inserts = false;
+        let result = run_revert(&slot, fake.command(), &env, &mut host, "rw-1", None).await.unwrap();
+        assert_eq!(result.delivered, RevertDelivered::Copied);
+        assert_eq!(host.copies, ["ORIGINAL"]);
+
+        // A rewrite the slot does not hold (a pill rewrite): the caller says how it was delivered.
+        let mut host = FakeHost::new();
+        let result = run_revert(&slot, fake.command(), &env, &mut host, "rw-9", Some("inserted"))
+            .await
+            .unwrap();
+        assert_eq!(result.delivered, RevertDelivered::Copied);
+        assert_eq!(host.copies, ["ORIGINAL"]);
+        assert!(host.calls.is_empty(), "no in-place revert for a rewrite the slot does not hold");
+        assert_eq!(
+            params_of(&fake, "outcome")[1],
+            json!({"rewrite_id": "rw-9", "delivered": "inserted", "reverted_via": "copied"})
+        );
+    }
+
+    #[tokio::test]
+    async fn quill_flow_revert_without_delivered_for_a_foreign_rewrite_is_bad_request_with_no_request() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+
+        let missing = run_revert(&slot, fake.command(), &env, &mut host, "rw-9", None).await.unwrap_err();
+        let invalid = run_revert(&slot, fake.command(), &env, &mut host, "rw-9", Some("printed"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(missing.code, QuillErrorCode::BadRequest);
+        assert_eq!(invalid.code, QuillErrorCode::BadRequest);
+        assert_eq!(fake.spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn quill_flow_revert_engine_error_touches_no_text() {
+        let body = r#"case "$method" in revert) fail revert_expired "too late";; esac"#;
+        let fake = FakeQuill::new(body);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+        host.slot_delivery = Some(Delivered::Inserted);
+
+        let error = run_revert(&slot, fake.command(), &env, &mut host, "rw-1", None).await.unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::RevertExpired);
+        assert_eq!(error.message, "too late");
+        assert!(host.calls.is_empty() && host.copies.is_empty());
+        assert_eq!(methods(&fake), ["ping", "revert"]);
+    }
+
+    // quill_flow_: report_outcome, list_modes
+
+    #[tokio::test]
+    async fn quill_flow_report_outcome_sends_one_outcome_line_with_exactly_the_given_fields() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+
+        let result = run_report_outcome(&slot, fake.command(), &env, "rw-1", "failed", None).await;
+        assert_eq!(result, Ok(QuillReportOutcomeResult {}));
+        run_report_outcome(&slot, fake.command(), &env, "rw-2", "inserted", Some("copied"))
+            .await
+            .unwrap();
+
+        assert_eq!(methods(&fake), ["ping", "outcome", "outcome"]);
+        assert_eq!(
+            params_of(&fake, "outcome"),
+            [
+                json!({"rewrite_id": "rw-1", "delivered": "failed"}),
+                json!({"rewrite_id": "rw-2", "delivered": "inserted", "reverted_via": "copied"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn quill_flow_report_outcome_refuses_values_outside_the_sets_without_a_request() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+
+        for (delivered, reverted_via) in [
+            ("printed", None),
+            ("", None),
+            ("Inserted", None),
+            ("inserted", Some("failed")),
+            ("inserted", Some("printed")),
+            ("copied", Some("")),
+        ] {
+            let error = run_report_outcome(&slot, fake.command(), &env, "rw-1", delivered, reverted_via)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, QuillErrorCode::BadRequest, "{delivered:?} {reverted_via:?}");
+        }
+        assert_eq!(fake.spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn quill_flow_list_modes_returns_camel_case_modes() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+
+        let result = run_list_modes(&slot, fake.command(), &env).await.unwrap();
+
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value,
+            json!({"modes": [{
+                "id": "only", "name": "n", "description": "d",
+                "form": "task", "targetModel": "claude", "default": true
+            }]})
+        );
+    }
+
+    // quill_timing_line_
+
+    #[test]
+    fn quill_timing_line_has_the_exact_format() {
+        assert_eq!(
+            quill_timing_line("task-claude", 10_000, 10_950, 300, TimingResult::Inserted),
+            "surface=hotkey mode=task-claude end_to_end_ms=950 engine_ms=300 result=inserted"
+        );
+        for (result, text) in [
+            (TimingResult::Inserted, "inserted"),
+            (TimingResult::Copied, "copied"),
+            (TimingResult::Failed, "failed"),
+            (TimingResult::Refused, "refused"),
+        ] {
+            assert!(quill_timing_line("m", 0, 0, 0, result).ends_with(&format!(" result={text}")));
+        }
+    }
+
+    #[test]
+    fn quill_timing_line_counts_from_the_press_and_saturates_at_zero() {
+        // Pressed 600 ms before the call was dispatched: the hold window is counted.
+        assert!(quill_timing_line("m", 9_400, 10_100, 0, TimingResult::Inserted)
+            .contains("end_to_end_ms=700 "));
+        // A frontend clock ahead of ours cannot produce a negative or wrapped value.
+        assert!(quill_timing_line("m", u64::MAX, 10, 0, TimingResult::Inserted).contains("end_to_end_ms=0 "));
+    }
+
+    #[test]
+    fn quill_timing_line_keeps_the_mode_to_one_safe_token() {
+        let line = quill_timing_line("evil mode\nresult=inserted\r[x]", 0, 0, 0, TimingResult::Failed);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.starts_with("surface=hotkey mode=evil_mode_result_inserted__x_ end_to_end_ms=0"));
+        let long = quill_timing_line(&"a".repeat(500), 0, 0, 0, TimingResult::Failed);
+        assert_eq!(long.split(' ').nth(1).unwrap().len(), "mode=".len() + 64);
+    }
+
+    #[test]
+    fn quill_timing_line_event_lines_carry_only_the_event_and_the_code() {
+        assert_eq!(
+            quill_event_line("outcome_failed", QuillErrorCode::Transport),
+            "quill outcome_failed code=transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn quill_timing_line_from_the_flow_uses_the_injected_clock() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        // engine start, engine end, inserter return
+        let mut host = FakeHost::new().with_clock(&[10_600, 10_900, 10_950]);
+
+        run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 10_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            host.logs(),
+            ["surface=hotkey mode=task-claude end_to_end_ms=950 engine_ms=300 result=inserted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn quill_timing_line_future_press_time_yields_zero() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new().with_clock(&[10_600, 10_900, 10_950]);
+
+        run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 99_999_999)
+            .await
+            .unwrap();
+
+        assert!(host.timing_lines()[0].contains("end_to_end_ms=0 "), "{:?}", host.logs());
+    }
+
+    #[tokio::test]
+    async fn quill_timing_line_each_code_maps_to_its_result_and_writes_exactly_one_line() {
+        let fs = NativeFs;
+        let flow = FakeQuill::new(FLOW_BODY);
+        let failing = FakeQuill::new(r#"case "$method" in rewrite) fail upstream_error "x";; esac"#);
+        let dying = FakeQuill::new("exit 0");
+
+        // (label, command, host tweak, expected result)
+        type Tweak = fn(&mut FakeHost);
+        let cases: Vec<(&str, &FakeQuill, Tweak, &str)> = vec![
+            ("inserted", &flow, |_| {}, "inserted"),
+            ("target_changed", &flow, |host| host.replace.inserted = false, "copied"),
+            ("no_selection", &flow, |host| host.selection = Err(QuillErrorCode::NoSelection), "refused"),
+            ("secure_field", &flow, |host| host.selection = Err(QuillErrorCode::SecureField), "refused"),
+            ("too_long", &flow, |host| host.selection = Err(QuillErrorCode::TooLong), "refused"),
+            (
+                "accessibility_permission",
+                &flow,
+                |host| host.selection = Err(QuillErrorCode::AccessibilityPermission),
+                "refused",
+            ),
+            ("modifiers_held", &flow, |host| host.selection = Err(QuillErrorCode::ModifiersHeld), "refused"),
+            ("upstream_error", &failing, |_| {}, "failed"),
+            ("transport", &dying, |_| {}, "failed"),
+        ];
+        for (label, fake, tweak, expected) in cases {
+            let env = env_for(fake, &fs, Duration::from_secs(5));
+            let slot = Mutex::new(None);
+            let mut host = FakeHost::new();
+            tweak(&mut host);
+            let _ = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0).await;
+            let lines = host.timing_lines();
+            assert_eq!(lines.len(), 1, "{label}: {:?}", host.logs());
+            assert!(lines[0].ends_with(&format!(" result={expected}")), "{label}: {}", lines[0]);
+        }
+
+        // busy and disabled never reach the engine and are failures too.
+        let env = env_for(&flow, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let held = slot.lock().await;
+        let mut host = FakeHost::new();
+        let _ = run_rewrite_selection(&slot, flow.command(), &env, &mut host, "task-claude", 0).await;
+        assert_eq!(host.timing_lines().len(), 1);
+        assert!(host.timing_lines()[0].ends_with(" result=failed"));
+        drop(held);
+        let mut host = FakeHost::new();
+        let _ = run_rewrite_selection(&slot, "quill", &env, &mut host, "task-claude", 0).await;
+        assert_eq!(host.timing_lines().len(), 1);
+        assert!(host.timing_lines()[0].ends_with(" result=failed"));
+    }
+
+    #[tokio::test]
+    async fn quill_timing_line_never_carries_selection_rewrite_or_engine_text() {
+        const SELECTION: &str = "SENTINEL-SELECTION-TEXT";
+        let body = r#"case "$method" in
+  rewrite) reply '{"rewrite_id":"rw-1","text":"SENTINEL-REWRITE-TEXT","mode":"task-claude","model":"m","latency_ms":1}';;
+  outcome) fail internal_error "SENTINEL-ENGINE-TEXT";;
+esac"#;
+        let fake = FakeQuill::new(body);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let mut host = FakeHost::new();
+        host.selection = Ok(SELECTION.to_string());
+        host.source_app = Some("SENTINEL-APP".to_string());
+
+        run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0)
+            .await
+            .unwrap();
+        host.selection = Err(QuillErrorCode::TooLong);
+        let _ = run_rewrite_selection(&slot, fake.command(), &env, &mut host, "task-claude", 0).await;
+
+        let logs = host.logs();
+        assert!(!logs.is_empty());
+        for line in &logs {
+            assert!(!line.contains("SENTINEL"), "{line}");
+            assert!(
+                line.starts_with("surface=hotkey mode=task-claude ")
+                    || (line.starts_with("quill ") && line.contains(" code=")),
+                "unexpected log line: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quill_timing_line_is_not_written_for_rewrite_text() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+        let host = FakeHost::new();
+
+        run_rewrite_text(&slot, fake.command(), &env, &host, text_args("pill")).await.unwrap();
+        let _ = run_rewrite_text(&slot, fake.command(), &env, &host, text_args("hotkey")).await;
+
+        assert!(host.timing_lines().is_empty(), "{:?}", host.logs());
+    }
+
+    // quill_should_spawn_at_setup_
+
+    #[test]
+    fn quill_should_spawn_at_setup_only_when_enabled_and_the_command_validated() {
+        let valid: Result<PathBuf, String> = Ok(PathBuf::from("/Users/me/.local/bin/quill"));
+        let invalid: Result<PathBuf, String> = Err("Quill command must be an absolute path.".to_string());
+        assert!(quill_should_spawn_at_setup(true, &valid));
+        assert!(!quill_should_spawn_at_setup(true, &invalid));
+        assert!(!quill_should_spawn_at_setup(false, &valid));
+        assert!(!quill_should_spawn_at_setup(false, &invalid));
+    }
+
+    #[tokio::test]
+    async fn quill_should_spawn_at_setup_spawn_fills_the_slot_without_a_request() {
+        let fake = FakeQuill::new(FLOW_BODY);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_secs(5));
+        let slot = Mutex::new(None);
+
+        spawn_into_slot(&slot, fake.command(), &env).await.unwrap();
+
+        assert!(slot.try_lock().unwrap().is_some());
+        assert_eq!(fake.spawn_count(), 1);
+        assert_eq!(methods(&fake), ["ping"]);
+        // A setup spawn never waits: a held slot is skipped as busy.
+        let _held = slot.lock().await;
+        let error = spawn_into_slot(&slot, fake.command(), &env).await.unwrap_err();
+        assert_eq!(error.code, QuillErrorCode::Busy);
     }
 }
