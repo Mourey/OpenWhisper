@@ -39,6 +39,12 @@ pub struct WorkerError {
     pub message: String,
 }
 
+/// Just the id of a reply line, for callers that parse the rest themselves.
+#[derive(Deserialize)]
+struct LineId {
+    id: String,
+}
+
 #[derive(Debug)]
 pub enum RequestError {
     /// The worker answered with an error; the connection is still healthy.
@@ -132,6 +138,36 @@ where
         params: Value,
         skip_id: Option<&str>,
     ) -> Result<WorkerResponse, RequestError> {
+        self.exchange_matching(method, params, skip_id, |line| {
+            let response: WorkerResponse = serde_json::from_str(line).map_err(|e| transport(&e))?;
+            Ok((response.id.clone(), response))
+        })
+        .await
+    }
+
+    /// Same framing, `skip_id` discard and id-mismatch rule as `exchange_raw`, but returns
+    /// the matching line untouched. Only its `id` is read here, so the caller can parse the
+    /// whole envelope as strictly as it likes.
+    pub async fn exchange_line(
+        &mut self,
+        method: &str,
+        params: Value,
+        skip_id: Option<&str>,
+    ) -> Result<String, RequestError> {
+        self.exchange_matching(method, params, skip_id, |line| {
+            let LineId { id } = serde_json::from_str(line).map_err(|e| transport(&e))?;
+            Ok((id, line.to_string()))
+        })
+        .await
+    }
+
+    async fn exchange_matching<T>(
+        &mut self,
+        method: &str,
+        params: Value,
+        skip_id: Option<&str>,
+        read: impl Fn(&str) -> Result<(String, T), RequestError>,
+    ) -> Result<T, RequestError> {
         if self.write_interrupted {
             return Err(RequestError::Transport(
                 "Previous request was interrupted while writing".to_string(),
@@ -153,11 +189,11 @@ where
 
         loop {
             let line = self.next_line().await?;
-            let response: WorkerResponse = serde_json::from_str(&line).map_err(|e| transport(&e))?;
-            if response.id == req.id {
-                return Ok(response);
+            let (id, reply) = read(&line)?;
+            if id == req.id {
+                return Ok(reply);
             }
-            if skip_id == Some(response.id.as_str()) {
+            if skip_id == Some(id.as_str()) {
                 continue;
             }
             return Err(RequestError::Transport("Worker response id mismatch".to_string()));
@@ -517,5 +553,85 @@ mod tests {
             transport_message(error),
             "Previous request was interrupted while writing"
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_line_returns_the_matching_line_verbatim() {
+        let (mut channel, mut peer, _) = pair();
+        let client = channel.exchange_line("ping", json!({}), None);
+        let server = async {
+            let (_, request) = peer.read_request().await;
+            let line = format!("{{\"id\":\"{}\",\"ok\":true,\"extra\":[1, 2]}}\n", id_of(&request));
+            peer.write(&line).await;
+            line
+        };
+        let (result, sent) = tokio::join!(client, server);
+
+        assert_eq!(result.unwrap(), sent, "unknown keys must survive for the caller's strict parse");
+    }
+
+    #[tokio::test]
+    async fn exchange_line_discards_the_skip_id_and_frames_a_split_reply_whole() {
+        let (mut channel, mut peer, _) = pair();
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            channel.exchange_line("rewrite", json!({}), None),
+        );
+        let server = async {
+            let (_, request) = peer.read_request().await;
+            let full = reply(&id_of(&request), json!({"late": true}));
+            let (head, tail) = full.split_at(full.len() / 2);
+            peer.write(head).await;
+            (id_of(&request), tail.to_string())
+        };
+        let (first, (abandoned, tail)) = tokio::join!(first, server);
+        assert!(first.is_err());
+        assert_eq!(channel.last_request_id(), Some(abandoned.as_str()));
+
+        let second = channel.exchange_line("ping", json!({}), Some(&abandoned));
+        let server = async {
+            let (_, request) = peer.read_request().await;
+            peer.write(&tail).await;
+            let own = reply(&id_of(&request), json!({"own": true}));
+            peer.write(&own).await;
+            own
+        };
+        let (second, own) = tokio::join!(second, server);
+
+        assert_eq!(second.unwrap(), own);
+    }
+
+    #[tokio::test]
+    async fn exchange_line_id_mismatch_and_unreadable_lines_are_transport_errors() {
+        let (mut channel, mut peer, _) = pair();
+        let client = channel.exchange_line("ping", json!({}), Some("abandoned"));
+        let server = async {
+            peer.read_request().await;
+            peer.write(&reply("someone-else", json!(null))).await;
+        };
+        let (result, ()) = tokio::join!(client, server);
+        assert_eq!(transport_message(result.unwrap_err()), "Worker response id mismatch");
+
+        let (mut channel, mut peer, _) = pair();
+        let client = channel.exchange_line("ping", json!({}), None);
+        let server = async {
+            peer.read_request().await;
+            peer.write("{\"no_id\":true}\n").await;
+        };
+        let (result, ()) = tokio::join!(client, server);
+        assert!(result.unwrap_err().is_transport());
+    }
+
+    #[tokio::test]
+    async fn exchange_line_closed_channel_is_a_transport_error_with_the_exit_text() {
+        let (mut channel, mut peer, _) = pair();
+        let client = channel.exchange_line("ping", json!({}), None);
+        let server = async move {
+            peer.read_request().await;
+            drop(peer);
+        };
+        let (result, ()) = tokio::join!(client, server);
+
+        assert_eq!(transport_message(result.unwrap_err()), "Worker process exited unexpectedly");
     }
 }

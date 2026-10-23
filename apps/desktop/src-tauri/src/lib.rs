@@ -5,6 +5,7 @@ mod macos_text_inserter;
 mod modifier_hold;
 #[cfg(target_os = "macos")]
 mod recording_shortcut;
+mod quill_client;
 mod worker_client;
 
 use anyhow::{anyhow, Result};
