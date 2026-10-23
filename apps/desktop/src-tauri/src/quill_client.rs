@@ -588,7 +588,18 @@ impl QuillClient {
             broken: false,
         };
 
-        let ping: PingResult = client.request_typed(QuillMethod::Ping, &PingParams {}).await?;
+        // Whatever goes wrong while starting, the caller sees a spawn failure: `transport`.
+        let ping: PingResult = client
+            .request_typed(QuillMethod::Ping, &PingParams {})
+            .await
+            .map_err(|error| match error.code {
+                QuillErrorCode::Transport => error,
+                code => QuillCommandError::transport(format!(
+                    "quill failed its startup ping ({}): {}",
+                    code.as_str(),
+                    error.message
+                )),
+            })?;
         if ping.protocol != "quill" || ping.version != "1" {
             return Err(QuillCommandError::transport(format!(
                 "quill speaks protocol {} version {}; expected quill version 1.",
@@ -641,6 +652,14 @@ impl QuillClient {
         .await;
 
         let line = match outcome {
+            Err(_elapsed) if self.channel.write_interrupted() => {
+                // A partial line misframes the engine's input; there is no reply to wait for.
+                return Err(QuillCommandError::transport(format!(
+                    "quill did not accept the {} request within {:?}; restarting it.",
+                    method.as_str(),
+                    self.timeout
+                )));
+            }
             Err(_elapsed) => {
                 self.abandoned = self.channel.last_request_id().map(str::to_owned);
                 self.consecutive_timeouts += 1;
@@ -1314,7 +1333,7 @@ mod tests {
     }
 
     /// A `/bin/sh` script standing in for `quill`: it records its argv, environment, spawn
-    /// count and every request line next to itself, answers `ping` with `__PING__` and runs
+    /// count and every request line next to itself, answers `ping` with `__PING_STEP__` and runs
     /// `__BODY__` for every other request, with `$id`, `$method`, `$n` (the count of
     /// non-ping requests), `$dir`, `reply`, `fail` and `modes` in scope.
     const SCRIPT: &str = r#"#!/bin/sh
@@ -1330,7 +1349,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/requests"
   id=$(printf '%s' "$line" | sed 's/^{"id":"\([^"]*\)".*/\1/')
   method=$(printf '%s' "$line" | sed 's/^{"id":"[^"]*","method":"\([^"]*\)".*/\1/')
-  if [ "$method" = ping ]; then reply '__PING__'; continue; fi
+  if [ "$method" = ping ]; then __PING_STEP__; continue; fi
   n=$((n+1))
   __BODY__
 done
@@ -1345,9 +1364,14 @@ done
 
     impl FakeQuill {
         fn with_ping(ping_result: &str, body: &str) -> Self {
+            Self::with_ping_step(&format!("reply '{ping_result}'"), body)
+        }
+
+        /// `ping_step` is the shell that answers `ping`, with `reply` and `fail` in scope.
+        fn with_ping_step(ping_step: &str, body: &str) -> Self {
             let dir = TempDir::new();
             let command = dir.0.join("quill");
-            let script = SCRIPT.replace("__PING__", ping_result).replace("__BODY__", body);
+            let script = SCRIPT.replace("__PING_STEP__", ping_step).replace("__BODY__", body);
             std::fs::write(&command, script).unwrap();
             std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self { dir, command }
@@ -1980,6 +2004,63 @@ done
         assert_eq!(fake.spawn_count(), 0, "no child may start without HOME");
     }
 
+    /// Fills an empty slot through `lease_quill`, which must fail; reports the error and
+    /// whether the slot is still empty. `spawn_timeout` bounds the startup `ping`.
+    async fn failed_lease(fake: &FakeQuill, spawn_timeout: Duration) -> (QuillCommandError, bool) {
+        let fs = NativeFs;
+        let env = QuillEnv {
+            fs: &fs,
+            home: Some(fake.dir.0.as_path()),
+            timeout: Duration::from_secs(5),
+            spawn_timeout,
+        };
+        let slot = Mutex::new(None);
+        let error = match lease_quill(&slot, fake.command(), &env).await {
+            Err(error) => error,
+            Ok(_) => panic!("the spawn must fail"),
+        };
+        let empty = slot.try_lock().unwrap().is_none();
+        (error, empty)
+    }
+
+    #[tokio::test]
+    async fn quill_spawn_ping_error_reply_is_transport_and_leaves_the_slot_empty() {
+        let fake = FakeQuill::with_ping_step(r#"fail internal_error "x""#, ECHO_MODES);
+        let (error, empty) = failed_lease(&fake, Duration::from_secs(5)).await;
+        assert_eq!(error.code, QuillErrorCode::Transport);
+        assert!(empty);
+    }
+
+    #[tokio::test]
+    async fn quill_spawn_unanswered_ping_is_transport_and_leaves_the_slot_empty() {
+        let fake = FakeQuill::with_ping_step("sleep 2", ECHO_MODES);
+        let (error, empty) = failed_lease(&fake, Duration::from_millis(200)).await;
+        assert_eq!(error.code, QuillErrorCode::Transport);
+        assert!(empty);
+    }
+
+    #[tokio::test]
+    async fn quill_spawn_child_exiting_during_ping_is_transport_and_leaves_the_slot_empty() {
+        let fake = FakeQuill::with_ping_step("exit 0", ECHO_MODES);
+        let (error, empty) = failed_lease(&fake, Duration::from_secs(5)).await;
+        assert_eq!(error.code, QuillErrorCode::Transport);
+        assert!(empty);
+    }
+
+    #[tokio::test]
+    async fn quill_spawn_wrong_ping_and_parse_failures_leave_the_slot_empty() {
+        for ping in [
+            r#"{"protocol":"quill","version":"2"}"#,
+            r#"{"protocol":"other","version":"1"}"#,
+            r#"{"protocol":"quill","version":"1","extra":1}"#,
+        ] {
+            let fake = FakeQuill::with_ping(ping, ECHO_MODES);
+            let (error, empty) = failed_lease(&fake, Duration::from_secs(5)).await;
+            assert_eq!(error.code, QuillErrorCode::Transport, "{ping}");
+            assert!(empty, "{ping}");
+        }
+    }
+
     #[tokio::test]
     async fn quill_spawn_failure_is_a_transport_error() {
         let dir = TempDir::new();
@@ -2260,6 +2341,54 @@ esac"#;
         let second = list_modes(&slot, fake.command(), &env).await.unwrap_err();
         assert_eq!(second.code, QuillErrorCode::Transport, "the second expiry is a transport error");
         assert!(slot.try_lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn quill_timeout_expiry_during_the_request_write_is_transport_and_respawns() {
+        // The first child answers the ping and then stops reading stdin for a while, so a
+        // large request stalls in the pipe; the second child behaves.
+        let ping_step = r#"reply '{"protocol":"quill","version":"1"}'
+if [ ! -f "$dir/stalled" ]; then : > "$dir/stalled"; sleep 3; fi"#;
+        let fake = FakeQuill::with_ping_step(ping_step, ECHO_MODES);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_millis(200));
+        let slot = Mutex::new(None);
+        let huge = RewriteParams {
+            text: "x".repeat(1 << 20),
+            mode: "task-claude".into(),
+            surface: Surface::Hotkey,
+            source_app: None,
+            target_model: None,
+        };
+
+        let mut lease = lease_quill(&slot, fake.command(), &env).await.unwrap();
+        let error = lease
+            .client()
+            .request_typed::<_, RewriteResult>(QuillMethod::Rewrite, &huge)
+            .await
+            .unwrap_err();
+        drop(lease);
+
+        assert_eq!(error.code, QuillErrorCode::Transport, "{}", error.message);
+        assert!(slot.try_lock().unwrap().is_none(), "a cut-short write empties the slot");
+
+        // The next call starts a fresh child instead of writing after a partial line.
+        assert_eq!(only_mode_id(list_modes(&slot, fake.command(), &env).await.unwrap()), "only");
+        assert_eq!(fake.spawn_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn quill_timeout_expiry_while_waiting_for_the_reply_is_still_a_timeout() {
+        let body = r#"if [ "$n" = 1 ]; then sleep 0.3; fi; reply "$(modes first)""#;
+        let fake = FakeQuill::new(body);
+        let fs = NativeFs;
+        let env = env_for(&fake, &fs, Duration::from_millis(200));
+        let slot = Mutex::new(None);
+
+        let error = list_modes(&slot, fake.command(), &env).await.unwrap_err();
+
+        assert_eq!(error.code, QuillErrorCode::Timeout);
+        assert!(slot.try_lock().unwrap().is_some(), "the abandoned-id path is unchanged");
     }
 
     // ---- quill_lease_ (R9.3 revalidation) -------------------------------------------

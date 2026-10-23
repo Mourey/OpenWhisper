@@ -115,6 +115,12 @@ where
         self.last_id.as_deref()
     }
 
+    /// True when a request line was only partly written (its future was dropped mid-write),
+    /// so the child's input is misframed and the channel must not be reused.
+    pub fn write_interrupted(&self) -> bool {
+        self.write_interrupted
+    }
+
     /// Sends a request and returns its result, rendering an error reply as
     /// `"<code>: <message>"`. Never skips an id: the worker has no abandoned requests.
     pub async fn exchange(&mut self, method: &str, params: Value) -> Result<Value, RequestError> {
