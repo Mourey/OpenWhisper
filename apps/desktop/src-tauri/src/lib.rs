@@ -1,3 +1,4 @@
+mod jsonl_client;
 #[cfg(target_os = "macos")]
 mod macos_text_inserter;
 #[cfg(target_os = "macos")]
