@@ -196,6 +196,61 @@ describe("quill-press-window", () => {
     expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
     expect(calls.lastIndexOf("quill_picker_close")).toBeGreaterThan(calls.indexOf("quill_picker_open"));
   });
+
+  it("releases the picker keys when opening fails after they were registered", async () => {
+    const calls: string[] = [];
+    const notices: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      return cmd === "quill_list_modes" ? { modes: MODES } : null;
+    });
+    class ThrowingPicker extends QuillPicker {
+      open() {
+        throw new Error("render failed");
+      }
+    }
+    const picker = new ThrowingPicker({ announce: () => {} });
+    const hotkey = new QuillHotkey({
+      invoke,
+      catalog: new QuillCatalog(invoke),
+      picker,
+      storedDefault: () => "task-claude",
+      notify: (text) => notices.push(text),
+      onRewritten: () => {},
+    });
+    hotkey.press();
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(picker.isOpen).toBe(false);
+    expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
+    expect(calls.lastIndexOf("quill_picker_close")).toBeGreaterThan(calls.indexOf("quill_picker_open"));
+    expect(notices).toEqual([QUILL_NOTICES.transport]);
+  });
+
+  it("logs a failed picker-key release without the picker-open alert", async () => {
+    const notices: string[] = [];
+    const logs: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === "quill_list_modes") return { modes: [] };
+      if (cmd === "quill_picker_close") throw { code: "transport", message: "Worker process exited unexpectedly" };
+      return null;
+    });
+    const picker = new QuillPicker({ announce: () => {} });
+    const hotkey = new QuillHotkey({
+      invoke,
+      catalog: new QuillCatalog(invoke),
+      picker,
+      storedDefault: () => "task-claude",
+      notify: (text) => notices.push(text),
+      onRewritten: () => {},
+      log: (line) => logs.push(line),
+    });
+    hotkey.press();
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(notices).toEqual([]);
+    expect(logs).toEqual([quillLogLine("picker_close_failed", "transport")]);
+  });
 });
 
 describe("quill-error-contract", () => {

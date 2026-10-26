@@ -200,4 +200,14 @@ describe("quill-revert-slot", () => {
     expect(body("quill_revert")).not.toContain(".inspect(|_| recording_shortcut::disarm_revert())");
     expect(lib).toMatch(/^\s+quill_revert_arm,$/m);
   });
+
+  it("disarms only the revert window its quill_revert started in", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert(");
+    const body = lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    const captured = body.indexOf("let reverting = recording_shortcut::revert_generation_now();");
+    expect(captured).toBeGreaterThan(0);
+    expect(captured).toBeLessThan(body.indexOf("with_quill("));
+    expect(body).toContain("recording_shortcut::disarm_revert(reverting)");
+  });
 });

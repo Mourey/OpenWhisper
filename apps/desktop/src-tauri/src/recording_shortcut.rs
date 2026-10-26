@@ -695,14 +695,33 @@ fn revert_arm(
 }
 
 /// Closes the revert window at once. Returns whether the hotkey was released.
+#[cfg(test)]
 fn revert_disarm(
     quill: &Mutex<Quill>,
+    unregister: impl FnMut(Shortcut) -> Result<(), String>,
+) -> bool {
+    revert_disarm_since(quill, None, unregister)
+}
+
+/// The revert window's generation, which every arm and disarm moves.
+fn revert_generation(quill: &Mutex<Quill>) -> Option<u64> {
+    quill.lock().ok().map(|state| state.revert_generation)
+}
+
+/// Closes the revert window unless it was armed or disarmed after `generation`, so a late
+/// revert of an older rewrite leaves a newer rewrite's window armed. `None` always closes.
+fn revert_disarm_since(
+    quill: &Mutex<Quill>,
+    generation: Option<u64>,
     mut unregister: impl FnMut(Shortcut) -> Result<(), String>,
 ) -> bool {
     {
         let Ok(mut state) = quill.lock() else {
             return false;
         };
+        if generation.is_some_and(|generation| generation != state.revert_generation) {
+            return false;
+        }
         state.revert_generation += 1;
         state.revert_deadline = None;
         match state.revert {
@@ -924,10 +943,16 @@ pub(crate) fn arm_revert() {
     }
 }
 
-/// Closes the revert window after `quill_revert`. Runs in a command.
-pub(crate) fn disarm_revert() {
+/// The revert window's generation as `quill_revert` starts, for `disarm_revert`.
+pub(crate) fn revert_generation_now() -> Option<u64> {
+    revert_generation(&QUILL)
+}
+
+/// Closes the revert window after `quill_revert`, unless a newer rewrite armed it after
+/// `since`. Runs in a command.
+pub(crate) fn disarm_revert(since: Option<u64>) {
     if let Some(app) = QUILL_APP.get() {
-        revert_disarm(&QUILL, |shortcut| quill_unregister_native(app, shortcut));
+        revert_disarm_since(&QUILL, since, |shortcut| quill_unregister_native(app, shortcut));
     }
 }
 
@@ -1599,5 +1624,35 @@ mod tests {
         let failed: Result<&str, &str> = after_revert(Err("target_changed"), || *disarmed.borrow_mut() += 1);
         assert_eq!(failed, Err("target_changed"));
         assert_eq!(*disarmed.borrow(), 2, "a failed revert left the revert hotkey armed");
+    }
+
+    #[test]
+    fn quill_revert_hotkey_late_revert_leaves_a_newer_window_armed() {
+        let quill = Mutex::new(Quill::new());
+        let start = Instant::now();
+        revert_arm(&quill, start, |_| Ok(())).unwrap();
+        let reverting = revert_generation(&quill);
+        revert_arm(&quill, start + Duration::from_secs(5), |_| Ok(())).unwrap();
+        assert!(!revert_disarm_since(&quill, reverting, |_| panic!("released a newer rewrite's hotkey")));
+        let released = RefCell::new(vec![]);
+        assert!(revert_disarm_since(&quill, revert_generation(&quill), |shortcut| {
+            released.borrow_mut().push(shortcut.id());
+            Ok(())
+        }));
+        assert_eq!(*released.borrow(), vec![quill_revert_id()]);
+    }
+
+    #[test]
+    fn quill_revert_hotkey_revert_with_no_newer_rewrite_disarms() {
+        let quill = Mutex::new(Quill::new());
+        revert_arm(&quill, Instant::now(), |_| Ok(())).unwrap();
+        let reverting = revert_generation(&quill);
+        let released = RefCell::new(0);
+        assert!(revert_disarm_since(&quill, reverting, |_| {
+            *released.borrow_mut() += 1;
+            Ok(())
+        }));
+        assert_eq!(*released.borrow(), 1);
+        assert!(!revert_disarm_since(&quill, None, |_| panic!("already released")));
     }
 }

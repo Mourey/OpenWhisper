@@ -391,7 +391,7 @@ export class QuillHotkey {
       void this.dispatch(modeId, pressedAtMs);
     };
     deps.picker.onClose = () => {
-      void deps.invoke("quill_picker_close").catch((error) => this.fail("picker_close_failed", error, false));
+      void this.releasePickerKeys();
     };
   }
 
@@ -421,17 +421,24 @@ export class QuillHotkey {
 
   private async openPicker() {
     this.pickerOpening = true;
+    let registered = false;
     try {
       const modes = await this.deps.catalog.load();
       await this.deps.invoke("quill_picker_open");
+      registered = true;
       const mode = effectiveMode(modes, this.sessionMode, this.deps.storedDefault());
       this.deps.picker.open(modes, mode?.id ?? "");
-      if (!this.deps.picker.isOpen) await this.deps.invoke("quill_picker_close");
     } catch (error) {
       this.fail("picker_open_failed", error, true);
     } finally {
       this.pickerOpening = false;
+      if (registered && !this.deps.picker.isOpen) await this.releasePickerKeys();
     }
+  }
+
+  /** Releases the native picker keys; a failure is logged, never shown as an alert. */
+  private releasePickerKeys() {
+    return this.deps.invoke("quill_picker_close").catch((error) => this.fail("picker_close_failed", error, false));
   }
 
   private async dispatch(modeId: string | null, pressedAtMs: number) {

@@ -1926,6 +1926,7 @@ async fn quill_revert(
 ) -> Result<QuillRevertResult, QuillCommandError> {
     #[cfg(target_os = "macos")]
     {
+        let reverting = recording_shortcut::revert_generation_now();
         let result = with_quill(&state, |slot, command, env| {
             Box::pin(async move {
                 quill_client::run_revert(
@@ -1940,7 +1941,7 @@ async fn quill_revert(
             })
         })
         .await;
-        recording_shortcut::after_revert(result, recording_shortcut::disarm_revert)
+        recording_shortcut::after_revert(result, || recording_shortcut::disarm_revert(reverting))
     }
     #[cfg(not(target_os = "macos"))]
     {
