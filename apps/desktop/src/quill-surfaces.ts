@@ -434,7 +434,7 @@ export class QuillHotkey {
     onRewritten: (rewrite: QuillRewritten) => void;
     /** Whether the hook is on with a valid command; while not, a rewrite opens no revert slot. */
     hookReady?: () => boolean;
-    /** Reads settings from Rust after a rewrite, so the slot follows what Rust decided when arming. */
+    /** Reads settings from Rust after a rewrite; they show settings as of the read, not Rust's arm decision. */
     readSettings?: () => Promise<QuillSettingsView>;
     log?: (line: string) => void;
     timers?: Timers;
