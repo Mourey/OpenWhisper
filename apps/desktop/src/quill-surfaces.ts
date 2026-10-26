@@ -498,8 +498,10 @@ export class QuillHotkey {
 
   /**
    * Rust re-checks the hook under the save lock before arming, and a save writes its settings
-   * under the same lock, so settings read after the rewrite show what Rust decided; a save after
-   * the read closes the slot through the settings sync. A failed read falls back to the last state.
+   * and disarms under the same lock. The read does not take that lock, so it shows settings as of
+   * the read, not as of Rust's decision: a save before the re-check or between it and the read is
+   * seen, and a save after the read closes the slot through the settings sync. A failed read falls
+   * back to the last state.
    */
   private async slotAllowed() {
     if (this.deps.readSettings) {
