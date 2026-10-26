@@ -1640,6 +1640,12 @@ fn quill_binding(settings: &AppSettings) -> bool {
     recording_shortcut::quill_binding(settings.quill_enabled, quill_command_error(settings).as_deref())
 }
 
+/// Whether a save turns the hook off, which closes a live revert window.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quill_turned_off(previous: &AppSettings, updated: &AppSettings) -> bool {
+    previous.quill_enabled && !updated.quill_enabled
+}
+
 #[tauri::command]
 async fn app_save_settings(
     app_handle: AppHandle,
@@ -1751,6 +1757,10 @@ async fn app_save_settings(
         *worker = None;
     }
 
+    #[cfg(target_os = "macos")]
+    if quill_turned_off(&previous, &updated) {
+        recording_shortcut::disarm_revert(None);
+    }
     if previous.quill_enabled != updated.quill_enabled {
         let quill_state = state.inner().clone();
         let enabled = updated.quill_enabled;
@@ -2026,14 +2036,23 @@ fn quill_picker_close() {
 /// Opens the revert window for a dictation rewrite once its delivery opened the slot, so a
 /// rewrite that lands after the frontend guard or a failed delivery arms nothing.
 #[tauri::command]
-fn quill_revert_arm(rewrite_id: String) {
+fn quill_revert_arm(state: State<'_, Arc<AppState>>, rewrite_id: String) {
     #[cfg(target_os = "macos")]
-    {
+    if quill_revert_arm_allowed(&state) {
         recording_shortcut::claim_revert(&rewrite_id);
         recording_shortcut::arm_revert();
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = rewrite_id;
+    let _ = (&state, rewrite_id);
+}
+
+/// Whether `quill_revert_arm` may arm the revert hotkey: only while the hook is on.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quill_revert_arm_allowed(state: &AppState) -> bool {
+    state
+        .settings
+        .lock()
+        .is_ok_and(|settings| settings.quill_enabled)
 }
 
 /// The clipboard as `quill_clipboard_hold` and `quill_clipboard_release` see it.
@@ -3768,5 +3787,22 @@ mod tests {
         fn returns_nothing<F: std::future::Future<Output = Result<(), String>>>(_: fn(bool, String) -> F) {}
         let _: fn() -> Result<(), String> = quill_clipboard_hold;
         returns_nothing(quill_clipboard_release);
+    }
+
+    #[test]
+    fn quill_hook_off_revert_arm_is_refused() {
+        let off = quill_test_state(AppSettings { quill_enabled: false, ..AppSettings::default() });
+        assert!(!quill_revert_arm_allowed(&off), "armed the revert hotkey while the hook is off");
+        let on = quill_test_state(AppSettings { quill_enabled: true, ..AppSettings::default() });
+        assert!(quill_revert_arm_allowed(&on));
+    }
+
+    #[test]
+    fn quill_settings_turning_the_hook_off_closes_the_revert_window() {
+        let with = |enabled: bool| AppSettings { quill_enabled: enabled, ..AppSettings::default() };
+        assert!(quill_turned_off(&with(true), &with(false)));
+        assert!(!quill_turned_off(&with(true), &with(true)));
+        assert!(!quill_turned_off(&with(false), &with(false)));
+        assert!(!quill_turned_off(&with(false), &with(true)));
     }
 }

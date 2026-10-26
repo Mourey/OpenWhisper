@@ -232,4 +232,20 @@ describe("quill-revert-slot", () => {
       expect(claim).toBeLessThan(arm.indexOf("recording_shortcut::arm_revert()"));
     }
   });
+
+  it("arms only while the hook is on, and closes a live window when the hook is turned off", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const arm = body("quill_revert_arm");
+    const allowed = arm.indexOf("if quill_revert_arm_allowed(&state) {");
+    expect(allowed).toBeGreaterThan(0);
+    expect(allowed).toBeLessThan(arm.indexOf("recording_shortcut::claim_revert(&rewrite_id);"));
+    expect(body("app_save_settings")).toMatch(
+      /if quill_turned_off\(&previous, &updated\) \{\s+recording_shortcut::disarm_revert\(None\);/,
+    );
+  });
 });

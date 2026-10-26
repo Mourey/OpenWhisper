@@ -281,6 +281,25 @@ describe("quill-picker-model", () => {
       expect(errors).toEqual([via === "timer" ? "picker_timer_failed" : "picker_click_failed"]);
     }
   });
+  it("reports a render failure when its owner dismisses it, and stays closed", () => {
+    let fail = false;
+    let closes = 0;
+    const errors: string[] = [];
+    const picker = new QuillPicker({
+      announce: () => {},
+      onClose: () => { closes += 1; },
+      onError: (event) => errors.push(event),
+      render: () => {
+        if (fail) throw new Error("render failed");
+      },
+    });
+    picker.open(TEN_MODES, "task-claude");
+    fail = true;
+    expect(() => picker.dismiss("picker_recording_close_failed")).not.toThrow();
+    expect(picker.isOpen).toBe(false);
+    expect(closes).toBe(1);
+    expect(errors).toEqual(["picker_recording_close_failed"]);
+  });
 });
 
 describe("quill-picker-markup", () => {
@@ -340,5 +359,17 @@ describe("quill-picker-markup", () => {
     expect(reduced).toBeDefined();
     expect(reduced).toContain("rewriting");
     expect(reduced).toContain("animation: none");
+  });
+
+  it("closes the picker through dismiss on a recording start and a settings change", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const fn = (name: string) => {
+      const start = main.indexOf(name);
+      expect(start).toBeGreaterThan(0);
+      return main.slice(start, main.indexOf("\n}\n", start));
+    };
+    expect(fn("async function startRecording(")).toContain('quillPicker.dismiss("picker_recording_close_failed");');
+    expect(fn("function syncQuillSettingsUi(")).toContain('quillPicker.dismiss("picker_settings_close_failed");');
+    expect(main).not.toContain("quillPicker.close()");
   });
 });

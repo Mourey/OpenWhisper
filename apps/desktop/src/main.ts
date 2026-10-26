@@ -1275,7 +1275,7 @@ async function startRecording() {
     `startRecording enter state=${state} held=${pressToTalkHeld} starting=${pressToTalkStarting}`,
   );
   if (state !== "idle") return;
-  quillPicker.close();
+  quillPicker.dismiss("picker_recording_close_failed");
   const cancellation = new AbortController();
   currentRecordingCancellation = cancellation;
   recordingCancellationCleanup = null;
@@ -2272,7 +2272,7 @@ function syncQuillSettingsUi(settings: AppSettings) {
   syncQuillError();
   if (!quillHookReady(settings)) {
     quillCatalog.clear();
-    quillPicker.close();
+    quillPicker.dismiss("picker_settings_close_failed");
   } else if (!previous || !quillHookReady(previous) || previous.quillCommand !== settings.quillCommand) {
     quillCatalog.clear();
   }

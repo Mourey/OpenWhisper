@@ -309,10 +309,15 @@ export class QuillPicker {
 
   /** A click on the widget while open closes the picker. */
   click() {
+    this.dismiss("picker_click_failed");
+  }
+
+  /** Closes the picker for its owner; a render failure is reported as `event`, never thrown. */
+  dismiss(event: string) {
     try {
       this.close();
     } catch (error) {
-      this.onError("picker_click_failed", error);
+      this.onError(event, error);
     }
   }
 
