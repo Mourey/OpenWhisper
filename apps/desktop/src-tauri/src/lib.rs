@@ -1646,6 +1646,12 @@ fn quill_turned_off(previous: &AppSettings, updated: &AppSettings) -> bool {
     previous.quill_enabled && !updated.quill_enabled
 }
 
+/// Whether a save makes a valid quill command invalid, which also closes a live revert window.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quill_command_broke(previous_error: Option<&str>, updated_error: Option<&str>) -> bool {
+    previous_error.is_none() && updated_error.is_some()
+}
+
 #[tauri::command]
 async fn app_save_settings(
     app_handle: AppHandle,
@@ -1759,6 +1765,13 @@ async fn app_save_settings(
 
     #[cfg(target_os = "macos")]
     if quill_turned_off(&previous, &updated) {
+        recording_shortcut::disarm_revert(None);
+    }
+    #[cfg(target_os = "macos")]
+    if quill_command_broke(
+        quill_command_error(&previous).as_deref(),
+        quill_command_error(&updated).as_deref(),
+    ) {
         recording_shortcut::disarm_revert(None);
     }
     if previous.quill_enabled != updated.quill_enabled {
@@ -2035,15 +2048,38 @@ fn quill_picker_close() {
 
 /// Opens the revert window for a dictation rewrite once its delivery opened the slot, so a
 /// rewrite that lands after the frontend guard or a failed delivery arms nothing.
+/// Returns whether it armed, so the frontend opens no slot for a refused arm.
 #[tauri::command]
-fn quill_revert_arm(state: State<'_, Arc<AppState>>, rewrite_id: String) {
+async fn quill_revert_arm(state: State<'_, Arc<AppState>>, rewrite_id: String) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
-    if quill_revert_arm_allowed(&state) {
-        recording_shortcut::claim_revert(&rewrite_id);
-        recording_shortcut::arm_revert();
+    {
+        // Every save holds this lock for its whole run, so no save can land between the
+        // checks below and the arm, and a save's disarm cannot run before an arm it should undo.
+        let _update = state.settings_update.lock().await;
+        if !quill_command_ready(&state) {
+            return Ok(false);
+        }
+        if quill_revert_arm_allowed(&state) {
+            recording_shortcut::claim_revert(&rewrite_id);
+            recording_shortcut::arm_revert();
+            return Ok(true);
+        }
+        Ok(false)
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (&state, rewrite_id);
+    {
+        let _ = (&state, rewrite_id);
+        Ok(false)
+    }
+}
+
+/// Whether the configured quill command still validates.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quill_command_ready(state: &AppState) -> bool {
+    state
+        .settings
+        .lock()
+        .is_ok_and(|settings| quill_command_error(&settings).is_none())
 }
 
 /// Whether `quill_revert_arm` may arm the revert hotkey: only while the hook is on.
@@ -3804,5 +3840,13 @@ mod tests {
         assert!(!quill_turned_off(&with(true), &with(true)));
         assert!(!quill_turned_off(&with(false), &with(false)));
         assert!(!quill_turned_off(&with(false), &with(true)));
+    }
+
+    #[test]
+    fn quill_settings_a_save_that_breaks_the_command_closes_the_revert_window() {
+        assert!(quill_command_broke(None, Some("not executable")));
+        assert!(!quill_command_broke(None, None));
+        assert!(!quill_command_broke(Some("missing"), Some("not executable")));
+        assert!(!quill_command_broke(Some("missing"), None));
     }
 }

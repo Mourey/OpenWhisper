@@ -248,4 +248,40 @@ describe("quill-revert-slot", () => {
       /if quill_turned_off\(&previous, &updated\) \{\s+recording_shortcut::disarm_revert\(None\);/,
     );
   });
+
+  it("keeps the dictation slot closed when quill_revert_arm armed nothing", async () => {
+    for (const armed of [true, false]) {
+      const calls: Call[] = [];
+      const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        return cmd === "quill_revert_arm" ? armed : null;
+      });
+      const slot = new QuillRevertSlot({ invoke, notify: () => {}, announce: () => {} });
+      await settleDictationRewrite({ invoke, rewriteId: "r-d", delivered: "inserted", pasted: "text", slot, name: "Dictation cleanup" });
+      expect(calls.filter((call) => call.cmd === "quill_revert_arm")).toHaveLength(1);
+      expect(slot.view().visible).toBe(armed);
+    }
+  });
+
+  it("checks and arms under the save lock, and disarms when a save breaks the command", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const arm = body("quill_revert_arm");
+    expect(lib).toContain("async fn quill_revert_arm(");
+    const locked = arm.indexOf("let _update = state.settings_update.lock().await;");
+    const ready = arm.indexOf("if !quill_command_ready(&state) {");
+    expect(locked).toBeGreaterThan(0);
+    expect(ready).toBeGreaterThan(locked);
+    expect(ready).toBeLessThan(arm.indexOf("recording_shortcut::claim_revert(&rewrite_id);"));
+    expect(arm.indexOf("if quill_revert_arm_allowed(&state) {")).toBeGreaterThan(locked);
+    const save = body("app_save_settings");
+    expect(save.indexOf("let _update = state.settings_update.lock().await;")).toBeGreaterThan(0);
+    expect(save).toMatch(
+      /if quill_command_broke\(\s*quill_command_error\(&previous\)\.as_deref\(\),\s*quill_command_error\(&updated\)\.as_deref\(\),?\s*\) \{\s+recording_shortcut::disarm_revert\(None\);/,
+    );
+  });
 });

@@ -600,10 +600,12 @@ export async function settleDictationRewrite(options: {
     options.log?.(quillLogLine("report_outcome_failed", toQuillCommandError(error).code));
   });
   if (options.slot && delivered !== "failed") {
-    await invoke("quill_revert_arm", { rewriteId }).catch((error) => {
+    const armed = await invoke("quill_revert_arm", { rewriteId }).catch((error) => {
       options.log?.(quillLogLine("revert_arm_failed", toQuillCommandError(error).code));
+      return null;
     });
-    options.slot.open({ rewriteId, name: options.name ?? rewriteId, delivered });
+    // `false` means the hook is off or its command invalid, so a revert would only fail.
+    if (armed !== false) options.slot.open({ rewriteId, name: options.name ?? rewriteId, delivered });
   }
 }
 
