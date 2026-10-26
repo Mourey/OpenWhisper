@@ -541,6 +541,44 @@ describe("quill-press-window", () => {
     }
   });
 
+  it("asks Rust again after a not-ready sync during the query, so a delayed reply from an earlier save cannot veto an armed slot", async () => {
+    const off = { quillEnabled: false };
+    const cases: { name: string; answers: boolean[]; offDuring: number; opens: boolean; asks: number }[] = [
+      { name: "delayed reply, still armed", answers: [true, true], offDuring: 1, opens: true, asks: 2 },
+      { name: "save after the query disarmed", answers: [true, false], offDuring: 1, opens: false, asks: 2 },
+      { name: "a not-ready sync during every query", answers: [true, true, true], offDuring: 3, opens: false, asks: 3 },
+      { name: "no sync during the query", answers: [true], offDuring: 0, opens: true, asks: 1 },
+    ];
+    for (const { name, answers, offDuring, opens, asks } of cases) {
+      const rewritten: string[] = [];
+      const pending: ((armed: boolean) => void)[] = [];
+      const invoke = vi.fn(async (cmd: string) => {
+        if (cmd === "quill_list_modes") return { modes: MODES };
+        return cmd === "quill_rewrite_selection" ? REWRITE_RESULT : null;
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker: new QuillPicker({ announce: () => {} }),
+        storedDefault: () => "task-claude",
+        notify: () => {},
+        onRewritten: (rewrite) => rewritten.push(rewrite.rewriteId),
+        hookReady: () => true,
+        revertArmed: () => new Promise<boolean>((resolve) => pending.push(resolve)),
+      });
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(600);
+      for (let ask = 0; ask < answers.length; ask++) {
+        expect(pending, name).toHaveLength(ask + 1);
+        if (ask < offDuring) hotkey.settingsApplied(off);
+        pending[ask](answers[ask]);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(pending, name).toHaveLength(asks);
+      expect(rewritten, name).toEqual(opens ? [REWRITE_RESULT.rewriteId] : []);
+    }
+  });
+
   it("tells the hotkey about every settings sync", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const sync = main.slice(main.indexOf("function syncQuillSettingsUi("), main.indexOf("\n}\n", main.indexOf("function syncQuillSettingsUi(")));

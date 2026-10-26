@@ -329,4 +329,15 @@ describe("quill-revert-slot", () => {
     expect(macos.trim().split("\n").filter((line) => line.trim() && !line.trim().startsWith("//"))).toHaveLength(5);
     for (const write of ["claim_revert", "arm_revert", "disarm_revert", "settings.lock()", "save_settings"]) expect(body).not.toContain(write);
   });
+
+  it("answers no off macOS without touching state", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert_armed(");
+    expect(start).toBeGreaterThan(0);
+    const body = lib.slice(start, lib.indexOf("\n}\n", start));
+    const other = body.slice(body.indexOf('#[cfg(not(target_os = "macos"))]'));
+    expect(other.startsWith('#[cfg(not(target_os = "macos"))]')).toBe(true);
+    const lines = other.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("//"));
+    expect(lines).toEqual(['#[cfg(not(target_os = "macos"))]', "{", "let _ = (&state, rewrite_id);", "Ok(false)", "}"]);
+  });
 });

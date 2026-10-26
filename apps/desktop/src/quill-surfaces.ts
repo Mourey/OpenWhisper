@@ -425,6 +425,8 @@ export class QuillHotkey {
   private pickerOpening = false;
   /** While Rust's revert-armed query is in flight: whether a settings sync since showed the hook not ready. */
   private armedQueryVetoed: boolean | null = null;
+  /** How many times the hotkey asks Rust while not-ready syncs keep arriving during the query. */
+  private static readonly ARMED_QUERY_TRIES = 3;
   private readonly timers: Timers;
 
   constructor(private readonly deps: {
@@ -504,21 +506,24 @@ export class QuillHotkey {
    * Whether a successful hotkey rewrite opens its revert slot. First it asks Rust whether the
    * revert window serves this rewrite (`quill_revert_armed`, under the save lock, so a save's
    * disarm is either seen or still to come). A settings sync that shows the hook not ready while
-   * the query is in flight vetoes the slot, since its save may have run after Rust answered;
-   * settings cached before the query do not, so a stale cache cannot hide a slot Rust armed. A
-   * save whose reply comes after the query closes the slot through the settings sync. If the
+   * the query is in flight may come from a save Rust ran after answering, or from an earlier
+   * save whose reply was delayed, so it asks again: a later save has disarmed and the answer is
+   * no, an earlier one leaves it yes. If not-ready syncs keep arriving, no slot opens. Settings
+   * cached before the query never veto, so a stale cache cannot hide a slot Rust armed. A save
+   * whose reply comes after the query closes the slot through the settings sync. If the
    * query fails it reads settings instead: that read does not take the save lock, so it shows
    * settings as of the read, not as of Rust's decision. If the read fails too, the last settings
    * decide.
    */
   private async slotAllowed(rewriteId: string) {
     if (this.deps.revertArmed) {
-      this.armedQueryVetoed = false;
       try {
-        // Rust's answer covers saves it has run; a not-ready sync during the query vetoes one it
-        // may not have.
-        const armed = await this.deps.revertArmed(rewriteId);
-        return armed && !this.armedQueryVetoed;
+        for (let ask = 0; ask < QuillHotkey.ARMED_QUERY_TRIES; ask++) {
+          this.armedQueryVetoed = false;
+          if (!(await this.deps.revertArmed(rewriteId))) return false;
+          if (!this.armedQueryVetoed) return true;
+        }
+        return false;
       } catch {
         // Fall back to reading settings.
       } finally {
