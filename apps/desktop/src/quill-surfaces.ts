@@ -196,6 +196,17 @@ export function quillHookReady(settings: QuillSettingsView) {
   return Boolean(settings.quillEnabled) && !settings.quillCommandError;
 }
 
+/**
+ * Whether a successful hotkey rewrite may open its revert slot. Rust arms the revert hotkey only
+ * while the hook is ready, and a successful rewrite already means Rust saw it ready, so until the
+ * frontend holds settings from Rust (before they load, or the load-failure fallback, which has no
+ * quill fields) it defers to that; afterwards it follows the hook state Rust last reported.
+ */
+export function hotkeySlotAllowed(settings: QuillSettingsView | null) {
+  if (!settings || settings.quillEnabled === undefined) return true;
+  return quillHookReady(settings);
+}
+
 export function dictationCleanupEffective(settings: QuillSettingsView) {
   return quillHookReady(settings) && Boolean(settings.quillDictationCleanup);
 }

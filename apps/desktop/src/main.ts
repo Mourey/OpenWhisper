@@ -55,6 +55,7 @@ import {
   loadModeSelect,
   modeName,
   quillHookReady,
+  hotkeySlotAllowed,
   quillLogLine,
   quillNoticeDurationMs,
   recordingStartBlocked,
@@ -787,7 +788,7 @@ const quillHotkey = new QuillHotkey({
   storedDefault: () => quillSettings?.quillDefaultMode ?? "",
   notify: showQuillNotice,
   onRewritten: (rewrite) => quillSlot.open(rewrite),
-  hookReady: () => quillSettings !== null && quillHookReady(quillSettings),
+  hookReady: () => hotkeySlotAllowed(quillSettings),
   log: (line) => logDebug(line),
 });
 

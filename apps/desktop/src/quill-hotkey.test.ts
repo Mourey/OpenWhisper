@@ -8,6 +8,7 @@ import {
   QuillCatalog,
   QuillHotkey,
   QuillPicker,
+  hotkeySlotAllowed,
   quillLogLine,
   quillNotice,
   toQuillCommandError,
@@ -388,11 +389,20 @@ describe("quill-press-window", () => {
   it("wires the hook state into the hotkey and closes the slot when the hook stops being ready", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const wiring = main.slice(main.indexOf("const quillHotkey = new QuillHotkey({"), main.indexOf("});", main.indexOf("const quillHotkey = new QuillHotkey({")));
-    expect(wiring).toContain("hookReady: () => quillSettings !== null && quillHookReady(quillSettings),");
+    expect(wiring).toContain("hookReady: () => hotkeySlotAllowed(quillSettings),");
     const sync = main.slice(main.indexOf("function syncQuillSettingsUi("), main.indexOf("\n}\n", main.indexOf("function syncQuillSettingsUi(")));
     const notReady = sync.indexOf("if (!quillHookReady(settings)) {");
     expect(notReady).toBeGreaterThan(0);
-    expect(sync.indexOf("quillSlot.close();")).toBeGreaterThan(notReady);
+    const branch = sync.slice(notReady, sync.indexOf("} else if", notReady));
+    expect(branch).toContain("quillSlot.close();");
+  });
+
+  it("defers the hotkey slot to Rust until settings come from Rust, then follows the hook state", () => {
+    expect(hotkeySlotAllowed(null)).toBe(true);
+    expect(hotkeySlotAllowed({})).toBe(true);
+    expect(hotkeySlotAllowed({ quillEnabled: false })).toBe(false);
+    expect(hotkeySlotAllowed({ quillEnabled: true, quillCommandError: null })).toBe(true);
+    expect(hotkeySlotAllowed({ quillEnabled: true, quillCommandError: "not executable" })).toBe(false);
   });
 });
 
