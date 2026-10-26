@@ -359,6 +359,41 @@ describe("quill-press-window", () => {
       expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
     }
   });
+
+  it("opens no revert slot for a hotkey rewrite while the hook is not ready", async () => {
+    for (const ready of [true, false]) {
+      const calls: string[] = [];
+      const rewritten: string[] = [];
+      const invoke = vi.fn(async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "quill_list_modes") return { modes: MODES };
+        return cmd === "quill_rewrite_selection" ? REWRITE_RESULT : null;
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker: new QuillPicker({ announce: () => {} }),
+        storedDefault: () => "task-claude",
+        notify: () => {},
+        onRewritten: (rewrite) => rewritten.push(rewrite.rewriteId),
+        hookReady: () => ready,
+      });
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(600);
+      expect(calls.filter((cmd) => cmd === "quill_rewrite_selection")).toHaveLength(1);
+      expect(rewritten).toEqual(ready ? [REWRITE_RESULT.rewriteId] : []);
+    }
+  });
+
+  it("wires the hook state into the hotkey and closes the slot when the hook stops being ready", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const wiring = main.slice(main.indexOf("const quillHotkey = new QuillHotkey({"), main.indexOf("});", main.indexOf("const quillHotkey = new QuillHotkey({")));
+    expect(wiring).toContain("hookReady: () => quillSettings !== null && quillHookReady(quillSettings),");
+    const sync = main.slice(main.indexOf("function syncQuillSettingsUi("), main.indexOf("\n}\n", main.indexOf("function syncQuillSettingsUi(")));
+    const notReady = sync.indexOf("if (!quillHookReady(settings)) {");
+    expect(notReady).toBeGreaterThan(0);
+    expect(sync.indexOf("quillSlot.close();")).toBeGreaterThan(notReady);
+  });
 });
 
 describe("quill-error-contract", () => {

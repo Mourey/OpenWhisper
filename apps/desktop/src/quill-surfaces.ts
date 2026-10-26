@@ -416,6 +416,8 @@ export class QuillHotkey {
     storedDefault: () => string;
     notify: QuillNotify;
     onRewritten: (rewrite: QuillRewritten) => void;
+    /** Whether the hook is on with a valid command; while not, a rewrite opens no revert slot. */
+    hookReady?: () => boolean;
     log?: (line: string) => void;
     timers?: Timers;
   }) {
@@ -489,7 +491,11 @@ export class QuillHotkey {
       const mode = modeId ?? effectiveMode(modes, this.sessionMode, this.deps.storedDefault())?.id;
       if (!mode) return;
       const result = (await this.deps.invoke("quill_rewrite_selection", { mode, pressedAtMs })) as RewriteSelectionResult;
-      this.deps.onRewritten({ rewriteId: result.rewriteId, name: modeName(modes, result.mode), delivered: "inserted" });
+      // Rust arms the revert hotkey only while the hook is ready, so a slot opened otherwise
+      // would only offer a revert that fails with `disabled`.
+      if (this.deps.hookReady?.() !== false) {
+        this.deps.onRewritten({ rewriteId: result.rewriteId, name: modeName(modes, result.mode), delivered: "inserted" });
+      }
       if (result.clipboardReplaced) this.deps.notify(QUILL_CLIPBOARD_REPLACED, "status");
     } catch (error) {
       this.fail("rewrite_failed", error, true);

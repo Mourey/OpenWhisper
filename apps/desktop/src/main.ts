@@ -787,6 +787,7 @@ const quillHotkey = new QuillHotkey({
   storedDefault: () => quillSettings?.quillDefaultMode ?? "",
   notify: showQuillNotice,
   onRewritten: (rewrite) => quillSlot.open(rewrite),
+  hookReady: () => quillSettings !== null && quillHookReady(quillSettings),
   log: (line) => logDebug(line),
 });
 
@@ -1723,6 +1724,7 @@ async function pollOnce() {
   const sessionId = currentSessionId;
   if (signal?.aborted) return;
   pollInFlight = true;
+  let lastDelivery: { inserted: boolean } | null = null;
   try {
     const resp = await invoke<PollResponse>("worker_poll_session_events", {
       sessionId,
@@ -1802,6 +1804,7 @@ async function pollOnce() {
             : invoke<PasteResult>("paste_to_target", { text: finalTranscript }),
           copy: () => invoke<void>("copy_to_clipboard", { text: finalTranscript }),
         });
+        lastDelivery = delivery;
         if (!delivery || signal?.aborted || currentSessionId !== sessionId) return;
         await finishCurrentRecording("complete", finalTranscript, "");
         if (signal?.aborted || currentSessionId !== sessionId) return;
@@ -1835,6 +1838,8 @@ async function pollOnce() {
     }
   } finally {
     pollInFlight = false;
+    // A rewrite whose session ended after its delivery reports what was delivered.
+    if (quillDictationPending && lastDelivery) void settleQuillDictation(lastDelivery);
     // A rewrite whose delivery was abandoned still ends its clipboard hold.
     if (quillDictationPending) void settleQuillDictation(null);
   }
@@ -2273,6 +2278,8 @@ function syncQuillSettingsUi(settings: AppSettings) {
   if (!quillHookReady(settings)) {
     quillCatalog.clear();
     quillPicker.dismiss("picker_settings_close_failed");
+    // The save that made the hook not ready also disarmed the revert hotkey.
+    quillSlot.close();
   } else if (!previous || !quillHookReady(previous) || previous.quillCommand !== settings.quillCommand) {
     quillCatalog.clear();
   }

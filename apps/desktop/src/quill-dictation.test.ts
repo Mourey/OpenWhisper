@@ -196,4 +196,25 @@ describe("quill-dictation", () => {
     expect(poll.lastIndexOf("} finally {", ending)).toBeGreaterThan(settle);
     expect(dictationDelivered(null)).toBe("failed");
   });
+
+  it("asks for no restore after a failed delivery, reports failed and arms nothing", async () => {
+    const { calls, invoke } = fakeInvoke(async () => TEXT_RESULT);
+    await settleDictationRewrite({ invoke, rewriteId: "r-7", delivered: "failed", pasted: "Clean dictation." });
+    expect(calls).toEqual([
+      { cmd: "quill_clipboard_release", args: { restore: false, pasted: "Clean dictation." } },
+      { cmd: "quill_report_outcome", args: { rewriteId: "r-7", delivered: "failed" } },
+    ]);
+  });
+
+  it("reports what was delivered when the session ends after a successful delivery", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const start = main.indexOf("async function pollOnce(");
+    const poll = main.slice(start, main.indexOf("\n}\n", start));
+    const recorded = poll.indexOf("lastDelivery = delivery;");
+    expect(recorded).toBeGreaterThan(poll.indexOf("const delivery = await deliverTranscript("));
+    expect(recorded).toBeLessThan(poll.indexOf("if (!delivery || signal?.aborted || currentSessionId !== sessionId) return;"));
+    const delivered = poll.indexOf("if (quillDictationPending && lastDelivery) void settleQuillDictation(lastDelivery);");
+    expect(delivered).toBeGreaterThan(poll.lastIndexOf("} finally {"));
+    expect(delivered).toBeLessThan(poll.indexOf("if (quillDictationPending) void settleQuillDictation(null);"));
+  });
 });
