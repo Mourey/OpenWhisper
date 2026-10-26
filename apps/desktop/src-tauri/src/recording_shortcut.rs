@@ -685,7 +685,8 @@ fn revert_arm(
     if let Err(error) = registered {
         state.revert = RevertState::Off;
         state.revert_deadline = None;
-        state.revert_rewrite = None;
+        // The claim stays, so the slot keeps its button with no hotkey (R17.1); the next claim
+        // or a disarm replaces it.
         return Err(error);
     }
     if state.revert != RevertState::Arming {
@@ -978,8 +979,9 @@ pub(crate) fn claim_revert(rewrite_id: &str) {
     revert_claim(&QUILL, rewrite_id);
 }
 
-/// Whether the revert window still serves `rewrite_id`. Read it after
-/// `revert_generation_now`, so a claim between the two reads shows as another owner.
+/// Whether the revert window still serves `rewrite_id`, including after a failed hotkey
+/// registration. Read it after `revert_generation_now`, so a claim between the two reads
+/// shows as another owner.
 pub(crate) fn revert_window_is_for(rewrite_id: &str) -> bool {
     revert_owned_by(&QUILL, rewrite_id)
 }
@@ -1625,6 +1627,16 @@ mod tests {
         let quill = Mutex::new(Quill::new());
         assert!(revert_arm(&quill, Instant::now(), |_| Err("occupied".into())).is_err());
         assert!(!revert_disarm(&quill, |_| panic!("nothing is registered")));
+    }
+
+    #[test]
+    fn quill_revert_hotkey_failed_registration_keeps_the_claim_for_the_slot() {
+        let quill = Mutex::new(Quill::new());
+        revert_claim(&quill, "rewrite-x");
+        assert!(revert_arm(&quill, Instant::now(), |_| Err("occupied".into())).is_err());
+        assert!(revert_owned_by(&quill, "rewrite-x"), "a failed registration dropped the slot's claim");
+        assert!(!revert_disarm(&quill, |_| panic!("nothing is registered")));
+        assert!(!revert_owned_by(&quill, "rewrite-x"), "a disarm left the claim");
     }
 
     #[test]

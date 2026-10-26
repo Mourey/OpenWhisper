@@ -2079,6 +2079,23 @@ async fn quill_revert_arm(state: State<'_, Arc<AppState>>, rewrite_id: String) -
     }
 }
 
+/// Whether the revert window still serves `rewrite_id`, so the hotkey slot opens only where
+/// Rust armed (or tried to arm) for that rewrite. Read-only; under the save lock, so the answer
+/// falls before or after a save's disarm, never between its settings write and the disarm.
+#[tauri::command]
+async fn quill_revert_armed(state: State<'_, Arc<AppState>>, rewrite_id: String) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _update = state.settings_update.lock().await;
+        Ok(recording_shortcut::revert_window_is_for(&rewrite_id))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, rewrite_id);
+        Ok(false)
+    }
+}
+
 /// Whether the configured quill command still validates.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn quill_command_ready(state: &AppState) -> bool {
@@ -2916,6 +2933,7 @@ pub fn run() {
             quill_clipboard_hold,
             quill_clipboard_release,
             quill_revert_arm,
+            quill_revert_armed,
             worker_ping,
             worker_list_models,
             worker_start_session,

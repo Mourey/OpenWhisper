@@ -454,6 +454,55 @@ describe("quill-press-window", () => {
     const branch = sync.slice(notReady, sync.indexOf("} else if", notReady));
     expect(branch).toContain("if (quillSettingsFromRust(settings)) quillSlot.close();");
   });
+
+  it("opens the hotkey slot only when Rust reports the revert armed for this rewrite and the hook is still ready", async () => {
+    const cases: { armed: () => Promise<boolean>; last: boolean; opens: boolean; reads: number }[] = [
+      { armed: async () => false, last: true, opens: false, reads: 0 },
+      { armed: async () => true, last: true, opens: true, reads: 0 },
+      { armed: async () => true, last: false, opens: false, reads: 0 },
+      { armed: async () => { throw new Error("ipc"); }, last: true, opens: false, reads: 1 },
+    ];
+    for (const { armed, last, opens, reads } of cases) {
+      const calls: string[] = [];
+      const asked: string[] = [];
+      const rewritten: string[] = [];
+      const invoke = vi.fn(async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "quill_list_modes") return { modes: MODES };
+        return cmd === "quill_rewrite_selection" ? REWRITE_RESULT : null;
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker: new QuillPicker({ announce: () => {} }),
+        storedDefault: () => "task-claude",
+        notify: () => {},
+        onRewritten: (rewrite) => rewritten.push(rewrite.rewriteId),
+        hookReady: () => last,
+        readSettings: async () => {
+          calls.push("readSettings");
+          return { quillEnabled: false };
+        },
+        revertArmed: (rewriteId) => {
+          calls.push("revertArmed");
+          asked.push(rewriteId);
+          return armed();
+        },
+      });
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(600);
+      expect(calls.indexOf("revertArmed")).toBeGreaterThan(calls.indexOf("quill_rewrite_selection"));
+      expect(asked).toEqual([REWRITE_RESULT.rewriteId]);
+      expect(calls.filter((cmd) => cmd === "readSettings")).toHaveLength(reads);
+      expect(rewritten).toEqual(opens ? [REWRITE_RESULT.rewriteId] : []);
+    }
+  });
+
+  it("wires the hotkey slot to Rust's revert-armed query", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const wiring = main.slice(main.indexOf("const quillHotkey = new QuillHotkey({"), main.indexOf("});", main.indexOf("const quillHotkey = new QuillHotkey({")));
+    expect(wiring).toContain('revertArmed: (rewriteId) => invoke<boolean>("quill_revert_armed", { rewriteId }),');
+  });
 });
 
 describe("quill-error-contract", () => {

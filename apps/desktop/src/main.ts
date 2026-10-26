@@ -791,6 +791,7 @@ const quillHotkey = new QuillHotkey({
   onRewritten: (rewrite) => quillSlot.open(rewrite),
   hookReady: () => hotkeySlotAllowed(quillSettings),
   readSettings: () => invoke<AppSettings>("app_get_settings"),
+  revertArmed: (rewriteId) => invoke<boolean>("quill_revert_armed", { rewriteId }),
   log: (line) => logDebug(line),
 });
 

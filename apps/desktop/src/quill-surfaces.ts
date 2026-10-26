@@ -436,6 +436,8 @@ export class QuillHotkey {
     hookReady?: () => boolean;
     /** Reads settings from Rust after a rewrite; they show settings as of the read, not Rust's arm decision. */
     readSettings?: () => Promise<QuillSettingsView>;
+    /** Asks Rust whether the revert window serves this rewrite; read settings are the fallback. */
+    revertArmed?: (rewriteId: string) => Promise<boolean>;
     log?: (line: string) => void;
     timers?: Timers;
   }) {
@@ -503,7 +505,16 @@ export class QuillHotkey {
    * seen, and a save after the read closes the slot through the settings sync. A failed read falls
    * back to the last state.
    */
-  private async slotAllowed() {
+  private async slotAllowed(rewriteId: string) {
+    if (this.deps.revertArmed) {
+      try {
+        // Rust's answer covers saves it has run; the last settings veto one whose reply came
+        // first.
+        return (await this.deps.revertArmed(rewriteId)) && this.deps.hookReady?.() !== false;
+      } catch {
+        // Fall back to reading settings.
+      }
+    }
     if (this.deps.readSettings) {
       try {
         return hotkeySlotAllowed(await this.deps.readSettings());
@@ -529,7 +540,7 @@ export class QuillHotkey {
       const result = (await this.deps.invoke("quill_rewrite_selection", { mode, pressedAtMs })) as RewriteSelectionResult;
       // Rust arms the revert hotkey only while the hook is ready, so a slot opened otherwise
       // would only offer a revert that fails with `disabled`.
-      if (await this.slotAllowed()) {
+      if (await this.slotAllowed(result.rewriteId)) {
         this.deps.onRewritten({ rewriteId: result.rewriteId, name: modeName(modes, result.mode), delivered: "inserted" });
       }
       if (result.clipboardReplaced) this.deps.notify(QUILL_CLIPBOARD_REPLACED, "status");
