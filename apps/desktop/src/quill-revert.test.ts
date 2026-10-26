@@ -1,0 +1,343 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  QUILL_REVERT_COPIED,
+  QUILL_REVERT_WINDOW_MS,
+  QuillCatalog,
+  QuillHotkey,
+  QuillPicker,
+  QuillRevertSlot,
+  openSlotAfterDictation,
+  settleDictationRewrite,
+} from "./quill-surfaces";
+
+type Call = { cmd: string; args?: Record<string, unknown> };
+
+function slotHarness(revertResult: unknown = { delivered: "inserted" }) {
+  const calls: Call[] = [];
+  const notices: { text: string; role: string }[] = [];
+  const announced: string[] = [];
+  const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+    calls.push({ cmd, args });
+    if (cmd === "quill_revert") return revertResult;
+    return null;
+  });
+  const slot = new QuillRevertSlot({
+    invoke,
+    notify: (text, role) => notices.push({ text, role }),
+    announce: (text) => announced.push(text),
+  });
+  return { calls, notices, announced, invoke, slot };
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("quill-revert-slot", () => {
+  it("calls quill_revert with the exact argument object", async () => {
+    const h = slotHarness();
+    h.slot.open({ rewriteId: "r-1", name: "Task prompt for Claude", delivered: "inserted" });
+    await h.slot.revert();
+    expect(h.calls).toEqual([{ cmd: "quill_revert", args: { rewriteId: "r-1", delivered: "inserted" } }]);
+  });
+
+  it("is visible for 30 s with the countdown, then hidden", async () => {
+    const h = slotHarness();
+    expect(h.slot.view().visible).toBe(false);
+    h.slot.open({ rewriteId: "r-1", name: "Task prompt for Claude", delivered: "inserted" });
+    expect(QUILL_REVERT_WINDOW_MS).toBe(30_000);
+    expect(h.slot.view()).toEqual({
+      visible: true,
+      label: "Rewritten with Task prompt for Claude.",
+      countdown: "(30s)",
+      text: "Rewritten with Task prompt for Claude. Revert (30s)",
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.slot.view().text).toBe("Rewritten with Task prompt for Claude. Revert (29s)");
+    await vi.advanceTimersByTimeAsync(28_000);
+    expect(h.slot.view().countdown).toBe("(1s)");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(h.slot.view().visible).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.slot.view().visible).toBe(false);
+  });
+
+  it("reverts the slot's rewrite from the button and from the hotkey event", async () => {
+    const button = slotHarness();
+    button.slot.open({ rewriteId: "r-button", name: "A", delivered: "inserted" });
+    await button.slot.revert();
+    expect(button.calls).toEqual([{ cmd: "quill_revert", args: { rewriteId: "r-button", delivered: "inserted" } }]);
+    expect(button.slot.view().visible).toBe(false);
+    const hotkey = slotHarness();
+    hotkey.slot.open({ rewriteId: "r-hotkey", name: "A", delivered: "copied" });
+    await hotkey.slot.revertFromHotkey();
+    expect(hotkey.calls).toEqual([{ cmd: "quill_revert", args: { rewriteId: "r-hotkey", delivered: "copied" } }]);
+    expect(hotkey.slot.view().visible).toBe(false);
+  });
+
+  it("shows the copy notice when the original was copied", async () => {
+    const h = slotHarness({ delivered: "copied" });
+    h.slot.open({ rewriteId: "r-1", name: "A", delivered: "inserted" });
+    await h.slot.revert();
+    expect(QUILL_REVERT_COPIED).toBe("Original copied. Press Command+V to restore.");
+    expect(h.notices).toEqual([{ text: QUILL_REVERT_COPIED, role: "status" }]);
+  });
+
+  it("restarts the count when a new rewrite replaces the slot", async () => {
+    const h = slotHarness();
+    h.slot.open({ rewriteId: "r-old", name: "Old", delivered: "inserted" });
+    await vi.advanceTimersByTimeAsync(20_000);
+    h.slot.open({ rewriteId: "r-new", name: "New", delivered: "inserted" });
+    expect(h.slot.view().text).toBe("Rewritten with New. Revert (30s)");
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(h.slot.view().visible).toBe(true);
+    await h.slot.revertFromHotkey();
+    expect(h.calls).toEqual([{ cmd: "quill_revert", args: { rewriteId: "r-new", delivered: "inserted" } }]);
+  });
+
+  it("stays visible while a toast is shown", async () => {
+    const h = slotHarness();
+    h.slot.open({ rewriteId: "r-1", name: "A", delivered: "inserted" });
+    // A hotkey notice goes to the toast while the slot is open.
+    const toasts: string[] = [];
+    const hotkeyInvoke = vi.fn(async (cmd: string) =>
+      cmd === "quill_list_modes"
+        ? { modes: [{ id: "task-claude", name: "A", description: "", form: "task", targetModel: "claude", default: true }] }
+        : new Promise(() => {}));
+    const hotkey = new QuillHotkey({
+      invoke: hotkeyInvoke,
+      catalog: new QuillCatalog(hotkeyInvoke),
+      picker: new QuillPicker({ announce: () => {} }),
+      storedDefault: () => "task-claude",
+      notify: (text) => toasts.push(text),
+      onRewritten: () => {},
+    });
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(600);
+    hotkey.press();
+    expect(toasts).toEqual(["Still rewriting the last selection."]);
+    await vi.advanceTimersByTimeAsync(5400);
+    expect(h.slot.view().visible).toBe(true);
+    expect(h.slot.view().countdown).toBe("(24s)");
+  });
+
+  it("announces once per rewrite, never each second", async () => {
+    const h = slotHarness();
+    h.slot.open({ rewriteId: "r-1", name: "A", delivered: "inserted" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.announced).toEqual(["Rewritten with A."]);
+    h.slot.open({ rewriteId: "r-2", name: "B", delivered: "inserted" });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.announced).toEqual(["Rewritten with A.", "Rewritten with B."]);
+  });
+
+  it("reports no second outcome for a revert", async () => {
+    const h = slotHarness({ delivered: "copied" });
+    h.slot.open({ rewriteId: "r-1", name: "A", delivered: "inserted" });
+    await h.slot.revert();
+    await h.slot.revert();
+    expect(h.calls.map((call) => call.cmd)).toEqual(["quill_revert"]);
+  });
+
+  it("invokes nothing for a quill-revert event with no open slot", async () => {
+    const h = slotHarness();
+    await h.slot.revertFromHotkey();
+    h.slot.open({ rewriteId: "r-1", name: "A", delivered: "inserted" });
+    await vi.advanceTimersByTimeAsync(QUILL_REVERT_WINDOW_MS);
+    await h.slot.revertFromHotkey();
+    expect(h.calls).toEqual([]);
+  });
+
+  it("opens after a dictation rewrite only when it was inserted or copied", async () => {
+    expect(openSlotAfterDictation("inserted")).toBe(true);
+    expect(openSlotAfterDictation("copied")).toBe(true);
+    expect(openSlotAfterDictation("failed")).toBe(false);
+    for (const delivered of ["inserted", "copied", "failed"] as const) {
+      const h = slotHarness();
+      await settleDictationRewrite({ invoke: h.invoke, rewriteId: "r-d", delivered, pasted: "text", slot: h.slot, name: "Dictation cleanup" });
+      expect(h.slot.view().visible).toBe(delivered !== "failed");
+      if (delivered !== "failed") {
+        await h.slot.revertFromHotkey();
+        expect(h.calls.at(-1)).toEqual({ cmd: "quill_revert", args: { rewriteId: "r-d", delivered } });
+      }
+    }
+  });
+
+  it("hides the countdown element from assistive technology", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const countdown = main.match(/<span id="quill-revert-countdown"[^>]*>/)?.[0];
+    expect(countdown).toBeDefined();
+    expect(countdown).toContain('aria-hidden="true"');
+    expect(main).toContain("quillRevertCountdown.textContent = view.countdown");
+  });
+
+  it("arms the revert hotkey for a dictation rewrite only when its slot opens", async () => {
+    for (const delivered of ["inserted", "copied", "failed"] as const) {
+      const h = slotHarness();
+      await settleDictationRewrite({ invoke: h.invoke, rewriteId: "r-d", delivered, pasted: "text", slot: h.slot, name: "Dictation cleanup" });
+      const arms = h.calls.filter((call) => call.cmd === "quill_revert_arm");
+      expect(arms).toEqual(delivered === "failed" ? [] : [{ cmd: "quill_revert_arm", args: { rewriteId: "r-d" } }]);
+      expect(h.slot.view().visible).toBe(delivered !== "failed");
+    }
+  });
+
+  it("arms natively only after a hotkey rewrite, and disarms after every revert", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`async fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    expect(body("quill_rewrite_selection")).toContain("recording_shortcut::arm_revert()");
+    expect(body("quill_rewrite_text")).not.toContain("arm_revert");
+    expect(body("quill_revert")).toContain("recording_shortcut::after_revert(");
+    expect(body("quill_revert")).not.toContain(".inspect(|_| recording_shortcut::disarm_revert())");
+    expect(lib).toMatch(/^\s+quill_revert_arm,$/m);
+  });
+
+  it("disarms only the revert window its quill_revert started in", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert(");
+    const body = lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    const captured = body.indexOf("let reverting = recording_shortcut::revert_generation_now();");
+    expect(captured).toBeGreaterThan(0);
+    expect(captured).toBeLessThan(body.indexOf("with_quill("));
+    expect(body).toContain("recording_shortcut::disarm_revert(reverting)");
+  });
+
+  it("disarms only a revert window that still belongs to the reverted rewrite", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const revert = body("quill_revert");
+    const generation = revert.indexOf("let reverting = recording_shortcut::revert_generation_now();");
+    const owned = revert.indexOf("let owned = recording_shortcut::revert_window_is_for(&rewrite_id);");
+    expect(generation).toBeGreaterThan(0);
+    expect(owned).toBeGreaterThan(generation);
+    expect(owned).toBeLessThan(revert.indexOf("with_quill("));
+    expect(revert).toMatch(/if owned \{\s+recording_shortcut::disarm_revert\(reverting\)/);
+    for (const [name, id] of [["quill_rewrite_selection", "&result.rewrite_id"], ["quill_revert_arm", "&rewrite_id"]]) {
+      const arm = body(name);
+      const claim = arm.indexOf(`recording_shortcut::claim_revert(${id});`);
+      expect(claim).toBeGreaterThan(0);
+      expect(claim).toBeLessThan(arm.indexOf("recording_shortcut::arm_revert()"));
+    }
+  });
+
+  it("arms only while the hook is on, and closes a live window when the hook is turned off", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const arm = body("quill_revert_arm");
+    const allowed = arm.indexOf("if quill_revert_arm_allowed(&state) {");
+    expect(allowed).toBeGreaterThan(0);
+    expect(allowed).toBeLessThan(arm.indexOf("recording_shortcut::claim_revert(&rewrite_id);"));
+    expect(body("app_save_settings")).toMatch(
+      /if quill_turned_off\(&previous, &updated\) \{\s+recording_shortcut::disarm_revert\(None\);/,
+    );
+  });
+
+  it("keeps the dictation slot closed when quill_revert_arm armed nothing", async () => {
+    for (const armed of [true, false]) {
+      const calls: Call[] = [];
+      const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        return cmd === "quill_revert_arm" ? armed : null;
+      });
+      const slot = new QuillRevertSlot({ invoke, notify: () => {}, announce: () => {} });
+      await settleDictationRewrite({ invoke, rewriteId: "r-d", delivered: "inserted", pasted: "text", slot, name: "Dictation cleanup" });
+      expect(calls.filter((call) => call.cmd === "quill_revert_arm")).toHaveLength(1);
+      expect(slot.view().visible).toBe(armed);
+    }
+  });
+
+  it("checks and arms under the save lock, and disarms when a save breaks the command", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const arm = body("quill_revert_arm");
+    expect(lib).toContain("async fn quill_revert_arm(");
+    const locked = arm.indexOf("let _update = state.settings_update.lock().await;");
+    const ready = arm.indexOf("if !quill_command_ready(&state) {");
+    expect(locked).toBeGreaterThan(0);
+    expect(ready).toBeGreaterThan(locked);
+    expect(ready).toBeLessThan(arm.indexOf("recording_shortcut::claim_revert(&rewrite_id);"));
+    expect(arm.indexOf("if quill_revert_arm_allowed(&state) {")).toBeGreaterThan(locked);
+    const save = body("app_save_settings");
+    expect(save.indexOf("let _update = state.settings_update.lock().await;")).toBeGreaterThan(0);
+    expect(save).toMatch(
+      /if quill_command_broke\(\s*quill_command_error\(&previous\)\.as_deref\(\),\s*quill_command_error\(&updated\)\.as_deref\(\),?\s*\) \{\s+recording_shortcut::disarm_revert\(None\);/,
+    );
+  });
+
+  it("arms after a hotkey rewrite only under the save lock, with the hook on and the command valid", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_rewrite_selection(");
+    expect(start).toBeGreaterThan(0);
+    const body = lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    const rewrite = body.indexOf("let result = with_quill(");
+    const locked = body.indexOf("let _update = state.settings_update.lock().await;");
+    const checked = body.indexOf("if quill_command_ready(&state) && quill_revert_arm_allowed(&state) {");
+    const claim = body.indexOf("recording_shortcut::claim_revert(&result.rewrite_id);");
+    expect(rewrite).toBeGreaterThan(0);
+    expect(locked).toBeGreaterThan(rewrite);
+    expect(checked).toBeGreaterThan(locked);
+    expect(claim).toBeGreaterThan(checked);
+    expect(body).not.toContain(".inspect(");
+  });
+
+  it("answers whether the revert hotkey armed for a rewrite, read-only and under the save lock", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert_armed(");
+    expect(start).toBeGreaterThan(0);
+    const body = lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    const locked = body.indexOf("let _update = state.settings_update.lock().await;");
+    expect(locked).toBeGreaterThan(0);
+    expect(body.indexOf("recording_shortcut::revert_window_is_for(&rewrite_id)")).toBeGreaterThan(locked);
+    for (const write of ["claim_revert", "arm_revert", "disarm_revert"]) expect(body).not.toContain(write);
+    expect(lib).toMatch(/^\s+quill_revert_armed,$/m);
+  });
+
+  it("keeps the revert-armed query to its own body: the save lock, then the read, and nothing else", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert_armed(");
+    expect(start).toBeGreaterThan(0);
+    const end = lib.indexOf("\n}\n", start);
+    expect(end).toBeGreaterThan(start);
+    const body = lib.slice(start, end);
+    expect(body).not.toContain("\nfn ");
+    const macos = body.slice(body.indexOf('#[cfg(target_os = "macos")]'), body.indexOf('#[cfg(not(target_os = "macos"))]'));
+    const locked = macos.indexOf("let _update = state.settings_update.lock().await;");
+    const read = macos.indexOf("Ok(recording_shortcut::revert_window_is_for(&rewrite_id))");
+    expect(locked).toBeGreaterThan(0);
+    expect(read).toBeGreaterThan(locked);
+    expect(macos.trim().split("\n").filter((line) => line.trim() && !line.trim().startsWith("//"))).toHaveLength(5);
+    for (const write of ["claim_revert", "arm_revert", "disarm_revert", "settings.lock()", "save_settings"]) expect(body).not.toContain(write);
+  });
+
+  it("answers no off macOS without touching state", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert_armed(");
+    expect(start).toBeGreaterThan(0);
+    const body = lib.slice(start, lib.indexOf("\n}\n", start));
+    const other = body.slice(body.indexOf('#[cfg(not(target_os = "macos"))]'));
+    expect(other.startsWith('#[cfg(not(target_os = "macos"))]')).toBe(true);
+    const lines = other.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("//"));
+    expect(lines).toEqual(['#[cfg(not(target_os = "macos"))]', "{", "let _ = (&state, rewrite_id);", "Ok(false)", "}"]);
+  });
+});

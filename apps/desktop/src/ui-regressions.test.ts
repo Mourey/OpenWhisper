@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TRANSCRIPTION_MODELS } from "./transcription-model";
+import { QUILL_MODE_HINT, loadModeSelect } from "./quill-surfaces";
+import { vi } from "vitest";
 
 const desktopRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(desktopRoot, "../..");
@@ -298,5 +300,85 @@ describe("desktop regression contracts", () => {
     expect(css).toContain('.recording-transcript[data-expanded="false"][data-clamped="true"] .recording-transcript-text');
     expect(css).toContain("mask-image: linear-gradient(to bottom");
     expect(css).not.toContain(".recording-transcript-body");
+  });
+});
+
+describe("quill-settings", () => {
+  const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+  const native = readFileSync(resolve(desktopRoot, "src-tauri/src/lib.rs"), "utf8");
+
+  it("uses menu-toggle-row with aria-labels for both quill toggles", () => {
+    const rows = Array.from(main.matchAll(/<div class="menu-toggle-row">([\s\S]*?)<\/label>/g), (match) => match[1]);
+    expect(rows.some((row) => row.includes('aria-label="Rewrite with quill"') && row.includes(">Rewrite with quill</span>"))).toBe(true);
+    expect(rows.some((row) => row.includes('aria-label="Clean up dictations"') && row.includes(">Clean up dictations</span>"))).toBe(true);
+  });
+
+  it("has a quill error row that is hidden when the error is null", () => {
+    expect(main).toContain('<div id="menu-quill-error" class="menu-prompt-hint" role="alert" style="display:none"></div>');
+    expect(main).toContain('menuQuillError.style.display = error ? "" : "none"');
+  });
+
+  it("removes the refine block from main.ts", () => {
+    expect(main).not.toContain("menu-refine-settings");
+    expect(main).not.toContain("menu-refine-toggle");
+    expect(main).not.toContain("menu-refine-prompt-input");
+  });
+
+  it("keeps refineEnabled and refinePrompt in the type, the fallback and the Rust settings", () => {
+    const type = main.match(/type AppSettings = \{([\s\S]*?)\n\};/)?.[1];
+    expect(type).toContain("refineEnabled: boolean;");
+    expect(type).toContain("refinePrompt: string;");
+    expect(main).toContain('refineEnabled: false, refinePrompt: ""');
+    const rust = native.match(/struct AppSettings \{([\s\S]*?)\n\}/)?.[1];
+    expect(rust).toContain("refine_enabled: bool,");
+    expect(rust).toContain("refine_prompt: String,");
+  });
+
+  it("names only gpt-realtime-transcribe as streaming in Rust and TypeScript", () => {
+    const rust = native.match(/fn model_streams\(model: &str\) -> bool \{([\s\S]*?)\n\}/)?.[1];
+    expect(rust).toBeDefined();
+    expect(Array.from(rust!.matchAll(/"([^"]*)"/g), (match) => match[1])).toEqual(["gpt-realtime-transcribe"]);
+    const line18 = readFileSync(resolve(import.meta.dirname, "transcription-model.ts"), "utf8").split("\n")[17];
+    expect(line18).toContain("streamsText");
+    expect(Array.from(line18.matchAll(/"([^"]*)"/g), (match) => match[1])).toEqual(["gpt-realtime-transcribe"]);
+  });
+
+  it("leaves the mode select empty and disabled, with no engine call, while the hook is off or invalid", async () => {
+    for (const settings of [
+      { quillEnabled: false, quillCommandError: null },
+      { quillEnabled: true, quillCommandError: "Quill command must be an absolute path." },
+      { quillEnabled: false, quillCommandError: "Quill command must be an absolute path." },
+    ]) {
+      const invoke = vi.fn(async () => ({ modes: [] }));
+      const select = await loadModeSelect(settings, invoke);
+      expect(select.disabled).toBe(true);
+      expect(select.options).toEqual([]);
+      expect(select.hint).toBe("Turn on Quill to choose a mode");
+      expect(invoke).not.toHaveBeenCalled();
+    }
+    expect(QUILL_MODE_HINT).toBe("Turn on Quill to choose a mode");
+    expect(main).toContain("Turn on Quill to choose a mode");
+  });
+
+  it("fills the mode select from quill_list_modes by name while the hook is on and valid", async () => {
+    const invoke = vi.fn(async () => ({
+      modes: [
+        { id: "system-gpt", name: "System prompt for GPT", description: "", form: "system", targetModel: "gpt", default: false },
+        { id: "task-claude", name: "Task prompt for Claude", description: "", form: "task", targetModel: "claude", default: true },
+      ],
+    }));
+    const select = await loadModeSelect({ quillEnabled: true, quillCommandError: null, quillDefaultMode: "system-gpt" }, invoke);
+    expect(invoke.mock.calls).toEqual([["quill_list_modes"]]);
+    expect(select.disabled).toBe(false);
+    expect(select.hint).toBeNull();
+    expect(select.options).toEqual([
+      { value: "task-claude", label: "Task prompt for Claude" },
+      { value: "system-gpt", label: "System prompt for GPT" },
+    ]);
+    expect(select.selected).toBe("system-gpt");
+  });
+
+  it("disables Clean up dictations while the hook is off or invalid", () => {
+    expect(main).toContain("menuQuillCleanupToggle.disabled = !quillHookReady(");
   });
 });
