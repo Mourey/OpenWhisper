@@ -432,8 +432,13 @@ export class QuillHotkey {
     }, QUILL_PRESS_WINDOW_MS);
   }
 
+  /** A picker key event. A render failure is logged; the key's run and release still happen. */
   pickerKey(key: QuillPickerKey) {
-    this.deps.picker.key(key);
+    try {
+      this.deps.picker.key(key);
+    } catch (error) {
+      this.fail("picker_key_failed", error, false);
+    }
   }
 
   private async openPicker() {

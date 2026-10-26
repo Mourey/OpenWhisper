@@ -279,6 +279,44 @@ describe("quill-press-window", () => {
     expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
     expect(calls.lastIndexOf("quill_picker_close")).toBeGreaterThan(calls.indexOf("quill_picker_open"));
   });
+
+  it("logs a picker render failure on a key press and still runs the chosen rewrite", async () => {
+    const calls: string[] = [];
+    const logs: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd === "quill_list_modes") return { modes: MODES };
+      if (cmd === "quill_rewrite_selection") return REWRITE_RESULT;
+      return null;
+    });
+    let fail = false;
+    const picker = new QuillPicker({
+      announce: () => {},
+      render: () => {
+        if (fail) throw new Error("render failed");
+      },
+    });
+    const hotkey = new QuillHotkey({
+      invoke,
+      catalog: new QuillCatalog(invoke),
+      picker,
+      storedDefault: () => "task-claude",
+      notify: () => {},
+      onRewritten: () => {},
+      log: (line) => logs.push(line),
+    });
+    hotkey.press();
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(picker.isOpen).toBe(true);
+    fail = true;
+    expect(() => hotkey.pickerKey("enter")).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(picker.isOpen).toBe(false);
+    expect(logs).toEqual([quillLogLine("picker_key_failed", "transport")]);
+    expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
+    expect(calls.filter((cmd) => cmd === "quill_rewrite_selection")).toHaveLength(1);
+  });
 });
 
 describe("quill-error-contract", () => {
