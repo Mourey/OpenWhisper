@@ -1884,7 +1884,7 @@ async fn quill_rewrite_selection(
 ) -> Result<QuillRewriteSelectionResult, QuillCommandError> {
     #[cfg(target_os = "macos")]
     {
-        with_quill(&state, |slot, command, env| {
+        let result = with_quill(&state, |slot, command, env| {
             Box::pin(async move {
                 quill_client::run_rewrite_selection(
                     slot,
@@ -1897,11 +1897,17 @@ async fn quill_rewrite_selection(
                 .await
             })
         })
-        .await
-        .inspect(|result| {
-            recording_shortcut::claim_revert(&result.rewrite_id);
-            recording_shortcut::arm_revert()
-        })
+        .await;
+        if let Ok(result) = &result {
+            // As in `quill_revert_arm`: a save that turned the hook off or broke the command
+            // while the rewrite ran has already disarmed, so re-check under its lock.
+            let _update = state.settings_update.lock().await;
+            if quill_command_ready(&state) && quill_revert_arm_allowed(&state) {
+                recording_shortcut::claim_revert(&result.rewrite_id);
+                recording_shortcut::arm_revert()
+            }
+        }
+        result
     }
     #[cfg(not(target_os = "macos"))]
     {

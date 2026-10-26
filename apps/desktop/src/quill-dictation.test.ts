@@ -181,4 +181,19 @@ describe("quill-dictation", () => {
     expect(settled).toBeNull();
     expect(calls.map((call) => call.cmd)).toEqual(["quill_rewrite_text"]);
   });
+
+  it("ends the clipboard hold with a failed outcome when the delivery is abandoned", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const start = main.indexOf("async function pollOnce(");
+    expect(start).toBeGreaterThan(0);
+    const poll = main.slice(start, main.indexOf("\n}\n", start));
+    const abandoned = poll.indexOf("if (!delivery || signal?.aborted || currentSessionId !== sessionId) return;");
+    const settle = poll.indexOf("await settleQuillDictation(delivery);");
+    const ending = poll.indexOf("if (quillDictationPending) void settleQuillDictation(null);");
+    expect(abandoned).toBeGreaterThan(0);
+    expect(settle).toBeGreaterThan(abandoned);
+    expect(ending).toBeGreaterThan(settle);
+    expect(poll.lastIndexOf("} finally {", ending)).toBeGreaterThan(settle);
+    expect(dictationDelivered(null)).toBe("failed");
+  });
 });

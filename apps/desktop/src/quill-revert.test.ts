@@ -284,4 +284,20 @@ describe("quill-revert-slot", () => {
       /if quill_command_broke\(\s*quill_command_error\(&previous\)\.as_deref\(\),\s*quill_command_error\(&updated\)\.as_deref\(\),?\s*\) \{\s+recording_shortcut::disarm_revert\(None\);/,
     );
   });
+
+  it("arms after a hotkey rewrite only under the save lock, with the hook on and the command valid", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_rewrite_selection(");
+    expect(start).toBeGreaterThan(0);
+    const body = lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    const rewrite = body.indexOf("let result = with_quill(");
+    const locked = body.indexOf("let _update = state.settings_update.lock().await;");
+    const checked = body.indexOf("if quill_command_ready(&state) && quill_revert_arm_allowed(&state) {");
+    const claim = body.indexOf("recording_shortcut::claim_revert(&result.rewrite_id);");
+    expect(rewrite).toBeGreaterThan(0);
+    expect(locked).toBeGreaterThan(rewrite);
+    expect(checked).toBeGreaterThan(locked);
+    expect(claim).toBeGreaterThan(checked);
+    expect(body).not.toContain(".inspect(");
+  });
 });
