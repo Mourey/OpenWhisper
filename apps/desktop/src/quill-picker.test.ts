@@ -259,6 +259,28 @@ describe("quill-picker-model", () => {
       expect(runs).toEqual([key === "enter" ? "task-claude" : "task-gpt"]);
     }
   });
+  it("reports a render failure on the 10 s idle close and on a click instead of throwing", async () => {
+    for (const via of ["timer", "click"] as const) {
+      let fail = false;
+      let closes = 0;
+      const errors: string[] = [];
+      const picker = new QuillPicker({
+        announce: () => {},
+        onClose: () => { closes += 1; },
+        render: () => {
+          if (fail) throw new Error("render failed");
+        },
+      });
+      picker.onError = (event) => errors.push(event);
+      picker.open(TEN_MODES, "task-claude");
+      fail = true;
+      if (via === "timer") await vi.advanceTimersByTimeAsync(10_000);
+      else expect(() => picker.click()).not.toThrow();
+      expect(picker.isOpen).toBe(false);
+      expect(closes).toBe(1);
+      expect(errors).toEqual([via === "timer" ? "picker_timer_failed" : "picker_click_failed"]);
+    }
+  });
 });
 
 describe("quill-picker-markup", () => {

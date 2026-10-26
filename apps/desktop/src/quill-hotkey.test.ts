@@ -283,6 +283,7 @@ describe("quill-press-window", () => {
   it("logs a picker render failure on a key press and still runs the chosen rewrite", async () => {
     const calls: string[] = [];
     const logs: string[] = [];
+    const alerts: string[] = [];
     const invoke = vi.fn(async (cmd: string) => {
       calls.push(cmd);
       if (cmd === "quill_list_modes") return { modes: MODES };
@@ -301,7 +302,7 @@ describe("quill-press-window", () => {
       catalog: new QuillCatalog(invoke),
       picker,
       storedDefault: () => "task-claude",
-      notify: () => {},
+      notify: (text) => alerts.push(text),
       onRewritten: () => {},
       log: (line) => logs.push(line),
     });
@@ -314,8 +315,49 @@ describe("quill-press-window", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(picker.isOpen).toBe(false);
     expect(logs).toEqual([quillLogLine("picker_key_failed", "transport")]);
+    expect(alerts).toEqual([]);
     expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
     expect(calls.filter((cmd) => cmd === "quill_rewrite_selection")).toHaveLength(1);
+  });
+
+  it("logs a picker render failure on the idle close and on a widget click, with no alert", async () => {
+    for (const via of ["timer", "click"] as const) {
+      const calls: string[] = [];
+      const logs: string[] = [];
+      const alerts: string[] = [];
+      const invoke = vi.fn(async (cmd: string) => {
+        calls.push(cmd);
+        return cmd === "quill_list_modes" ? { modes: MODES } : null;
+      });
+      let fail = false;
+      const picker = new QuillPicker({
+        announce: () => {},
+        render: () => {
+          if (fail) throw new Error("render failed");
+        },
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker,
+        storedDefault: () => "task-claude",
+        notify: (text) => alerts.push(text),
+        onRewritten: () => {},
+        log: (line) => logs.push(line),
+      });
+      hotkey.press();
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(picker.isOpen).toBe(true);
+      fail = true;
+      if (via === "timer") await vi.advanceTimersByTimeAsync(10_000);
+      else expect(() => picker.click()).not.toThrow();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(picker.isOpen).toBe(false);
+      expect(logs).toEqual([quillLogLine(via === "timer" ? "picker_timer_failed" : "picker_click_failed", "transport")]);
+      expect(alerts).toEqual([]);
+      expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
+    }
   });
 });
 

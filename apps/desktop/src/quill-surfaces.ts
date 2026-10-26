@@ -246,6 +246,8 @@ export class QuillPicker {
   isOpen = false;
   onRun: (modeId: string, pressedAtMs: number) => void;
   onClose: () => void;
+  /** A close the picker started itself (idle timer, click) failed; `event` names which. */
+  onError: (event: string, error: unknown) => void;
   private rows: QuillMode[] = [];
   private highlighted = 0;
   private defaultId = "";
@@ -256,11 +258,13 @@ export class QuillPicker {
     announce: (text: string) => void;
     onRun?: (modeId: string, pressedAtMs: number) => void;
     onClose?: () => void;
+    onError?: (event: string, error: unknown) => void;
     render?: (view: QuillPickerView) => void;
     timers?: Timers;
   }) {
     this.onRun = deps.onRun ?? (() => {});
     this.onClose = deps.onClose ?? (() => {});
+    this.onError = deps.onError ?? (() => {});
     this.timers = deps.timers ?? defaultTimers;
   }
 
@@ -305,7 +309,11 @@ export class QuillPicker {
 
   /** A click on the widget while open closes the picker. */
   click() {
-    this.close();
+    try {
+      this.close();
+    } catch (error) {
+      this.onError("picker_click_failed", error);
+    }
   }
 
   close() {
@@ -352,7 +360,11 @@ export class QuillPicker {
     this.clearTimer();
     this.timer = this.timers.setTimeout(() => {
       this.timer = null;
-      this.close();
+      try {
+        this.close();
+      } catch (error) {
+        this.onError("picker_timer_failed", error);
+      }
     }, QUILL_PICKER_IDLE_MS);
   }
 
@@ -410,6 +422,7 @@ export class QuillHotkey {
     deps.picker.onClose = () => {
       void this.releasePickerKeys();
     };
+    deps.picker.onError = (event, error) => this.fail(event, error, false);
   }
 
   press() {
