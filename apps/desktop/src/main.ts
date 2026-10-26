@@ -2275,6 +2275,7 @@ function syncQuillError() {
 function syncQuillSettingsUi(settings: AppSettings) {
   const previous = quillSettings;
   quillSettings = settings;
+  quillHotkey.settingsApplied(settings);
   menuQuillEnabledToggle.checked = settings.quillEnabled ?? false;
   menuQuillCleanupToggle.checked = settings.quillDictationCleanup ?? false;
   menuQuillCleanupToggle.disabled = !quillHookReady(settings);

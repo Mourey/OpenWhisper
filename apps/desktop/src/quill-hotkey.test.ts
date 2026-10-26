@@ -459,7 +459,7 @@ describe("quill-press-window", () => {
     const cases: { armed: () => Promise<boolean>; last: boolean; opens: boolean; reads: number }[] = [
       { armed: async () => false, last: true, opens: false, reads: 0 },
       { armed: async () => true, last: true, opens: true, reads: 0 },
-      { armed: async () => true, last: false, opens: false, reads: 0 },
+      { armed: async () => true, last: false, opens: true, reads: 0 },
       { armed: async () => { throw new Error("ipc"); }, last: true, opens: false, reads: 1 },
     ];
     for (const { armed, last, opens, reads } of cases) {
@@ -502,6 +502,51 @@ describe("quill-press-window", () => {
     const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     const wiring = main.slice(main.indexOf("const quillHotkey = new QuillHotkey({"), main.indexOf("});", main.indexOf("const quillHotkey = new QuillHotkey({")));
     expect(wiring).toContain('revertArmed: (rewriteId) => invoke<boolean>("quill_revert_armed", { rewriteId }),');
+  });
+
+  it("vetoes the hotkey slot only for settings applied while Rust's revert-armed query is in flight", async () => {
+    const ready = { quillEnabled: true, quillCommandError: null };
+    const off = { quillEnabled: false };
+    const cases: { name: string; during: object[]; opens: boolean }[] = [
+      { name: "nothing applied", during: [], opens: true },
+      { name: "a save that turned the hook off", during: [off], opens: false },
+      { name: "off then on", during: [off, ready], opens: false },
+      { name: "a ready save", during: [ready], opens: true },
+      { name: "the load fallback", during: [{}], opens: true },
+    ];
+    for (const { name, during, opens } of cases) {
+      const rewritten: string[] = [];
+      let answer: (armed: boolean) => void = () => {};
+      const invoke = vi.fn(async (cmd: string) => {
+        if (cmd === "quill_list_modes") return { modes: MODES };
+        return cmd === "quill_rewrite_selection" ? REWRITE_RESULT : null;
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker: new QuillPicker({ announce: () => {} }),
+        storedDefault: () => "task-claude",
+        notify: () => {},
+        onRewritten: (rewrite) => rewritten.push(rewrite.rewriteId),
+        hookReady: () => false,
+        revertArmed: () => new Promise<boolean>((resolve) => { answer = resolve; }),
+      });
+      hotkey.settingsApplied(off);
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(600);
+      for (const settings of during) hotkey.settingsApplied(settings);
+      answer(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rewritten, name).toEqual(opens ? [REWRITE_RESULT.rewriteId] : []);
+    }
+  });
+
+  it("tells the hotkey about every settings sync", () => {
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const sync = main.slice(main.indexOf("function syncQuillSettingsUi("), main.indexOf("\n}\n", main.indexOf("function syncQuillSettingsUi(")));
+    const told = sync.indexOf("quillHotkey.settingsApplied(settings);");
+    expect(told).toBeGreaterThan(0);
+    expect(told).toBeLessThan(sync.indexOf("if (!quillHookReady(settings)) {"));
   });
 });
 

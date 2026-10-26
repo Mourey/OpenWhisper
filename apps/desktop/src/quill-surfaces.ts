@@ -423,6 +423,8 @@ export class QuillHotkey {
   inFlight = false;
   private pressTimer: unknown = null;
   private pickerOpening = false;
+  /** While Rust's revert-armed query is in flight: whether a settings sync since showed the hook not ready. */
+  private armedQueryVetoed: boolean | null = null;
   private readonly timers: Timers;
 
   constructor(private readonly deps: {
@@ -501,19 +503,26 @@ export class QuillHotkey {
   /**
    * Whether a successful hotkey rewrite opens its revert slot. First it asks Rust whether the
    * revert window serves this rewrite (`quill_revert_armed`, under the save lock, so a save's
-   * disarm is either seen or still to come), and the last settings veto a save whose reply came
-   * first; a save after that closes the slot through the settings sync. If the query fails it
-   * reads settings instead: that read does not take the save lock, so it shows settings as of the
-   * read, not as of Rust's decision. If the read fails too, the last settings decide.
+   * disarm is either seen or still to come). A settings sync that shows the hook not ready while
+   * the query is in flight vetoes the slot, since its save may have run after Rust answered;
+   * settings cached before the query do not, so a stale cache cannot hide a slot Rust armed. A
+   * save whose reply comes after the query closes the slot through the settings sync. If the
+   * query fails it reads settings instead: that read does not take the save lock, so it shows
+   * settings as of the read, not as of Rust's decision. If the read fails too, the last settings
+   * decide.
    */
   private async slotAllowed(rewriteId: string) {
     if (this.deps.revertArmed) {
+      this.armedQueryVetoed = false;
       try {
-        // Rust's answer covers saves it has run; the last settings veto one whose reply came
-        // first.
-        return (await this.deps.revertArmed(rewriteId)) && this.deps.hookReady?.() !== false;
+        // Rust's answer covers saves it has run; a not-ready sync during the query vetoes one it
+        // may not have.
+        const armed = await this.deps.revertArmed(rewriteId);
+        return armed && !this.armedQueryVetoed;
       } catch {
         // Fall back to reading settings.
+      } finally {
+        this.armedQueryVetoed = null;
       }
     }
     if (this.deps.readSettings) {
@@ -524,6 +533,11 @@ export class QuillHotkey {
       }
     }
     return this.deps.hookReady?.() !== false;
+  }
+
+  /** Called on every settings sync, so a save that lands while the revert-armed query is in flight can veto the slot. */
+  settingsApplied(settings: QuillSettingsView) {
+    if (this.armedQueryVetoed !== null && !hotkeySlotAllowed(settings)) this.armedQueryVetoed = true;
   }
 
   /** Releases the native picker keys; a failure is logged, never shown as an alert. */
