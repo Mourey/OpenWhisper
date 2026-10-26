@@ -238,6 +238,27 @@ describe("quill-picker-model", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(closes).toBe(0);
   });
+  it("still runs the chosen row when the close fails to render", () => {
+    for (const key of ["enter", "3"] as const) {
+      let fail = false;
+      let closes = 0;
+      const runs: string[] = [];
+      const picker = new QuillPicker({
+        announce: () => {},
+        onRun: (modeId) => runs.push(modeId),
+        onClose: () => { closes += 1; },
+        render: () => {
+          if (fail) throw new Error("render failed");
+        },
+      });
+      picker.open(TEN_MODES, "task-claude");
+      fail = true;
+      expect(() => picker.key(key)).toThrow("render failed");
+      expect(picker.isOpen).toBe(false);
+      expect(closes).toBe(1);
+      expect(runs).toEqual([key === "enter" ? "task-claude" : "task-gpt"]);
+    }
+  });
 });
 
 describe("quill-picker-markup", () => {

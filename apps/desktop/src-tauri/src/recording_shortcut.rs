@@ -722,7 +722,8 @@ fn revert_claim(quill: &Mutex<Quill>, rewrite_id: &str) {
     }
 }
 
-/// Whether the revert window was last claimed for `rewrite_id` and is still open.
+/// Whether the revert window was last claimed for `rewrite_id` and not released since. It
+/// does not check the window's state: `revert_disarm_since` returns false when it is `Off`.
 fn revert_owned_by(quill: &Mutex<Quill>, rewrite_id: &str) -> bool {
     quill
         .lock()

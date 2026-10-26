@@ -336,8 +336,12 @@ export class QuillPicker {
   private run(index: number) {
     const mode = this.rows[index];
     const pressedAtMs = this.timers.now();
-    this.close();
-    this.onRun(mode.id, pressedAtMs);
+    try {
+      this.close();
+    } finally {
+      // The keys are released by close; a render failure must not drop the chosen rewrite.
+      this.onRun(mode.id, pressedAtMs);
+    }
   }
 
   private highlightText() {
