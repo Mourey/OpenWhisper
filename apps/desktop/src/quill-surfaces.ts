@@ -426,6 +426,7 @@ export class QuillHotkey {
       await this.deps.invoke("quill_picker_open");
       const mode = effectiveMode(modes, this.sessionMode, this.deps.storedDefault());
       this.deps.picker.open(modes, mode?.id ?? "");
+      if (!this.deps.picker.isOpen) await this.deps.invoke("quill_picker_close");
     } catch (error) {
       this.fail("picker_open_failed", error, true);
     } finally {
@@ -552,6 +553,9 @@ export async function settleDictationRewrite(options: {
     options.log?.(quillLogLine("report_outcome_failed", toQuillCommandError(error).code));
   });
   if (options.slot && delivered !== "failed") {
+    await invoke("quill_revert_arm").catch((error) => {
+      options.log?.(quillLogLine("revert_arm_failed", toQuillCommandError(error).code));
+    });
     options.slot.open({ rewriteId, name: options.name ?? rewriteId, delivered });
   }
 }

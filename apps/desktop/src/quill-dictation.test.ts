@@ -167,4 +167,18 @@ describe("quill-dictation", () => {
     }
     expect(pressStart!.indexOf("if (recordingStartBlocked(state)) return;")).toBeLessThan(pressStart!.indexOf("pressToTalkHeld = true"));
   });
+
+  it("asks for no revert hotkey when the rewrite lands after the 8,000 ms guard", async () => {
+    let land: (value: unknown) => void = () => {};
+    const { calls, invoke } = fakeInvoke(() => new Promise((resolve) => { land = resolve; }));
+    let settled: unknown = "pending";
+    void rewriteDictation({ invoke, text: "raw", notify: () => {}, announce: () => {} })
+      .then((result) => { settled = result; });
+    await vi.advanceTimersByTimeAsync(QUILL_DICTATION_GUARD_MS);
+    expect(settled).toBeNull();
+    land(TEXT_RESULT);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBeNull();
+    expect(calls.map((call) => call.cmd)).toEqual(["quill_rewrite_text"]);
+  });
 });

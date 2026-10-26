@@ -1910,7 +1910,6 @@ async fn quill_rewrite_text(
             ))
         })
         .await
-        .inspect(|_| recording_shortcut::arm_revert())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1927,7 +1926,7 @@ async fn quill_revert(
 ) -> Result<QuillRevertResult, QuillCommandError> {
     #[cfg(target_os = "macos")]
     {
-        with_quill(&state, |slot, command, env| {
+        let result = with_quill(&state, |slot, command, env| {
             Box::pin(async move {
                 quill_client::run_revert(
                     slot,
@@ -1940,8 +1939,8 @@ async fn quill_revert(
                 .await
             })
         })
-        .await
-        .inspect(|_| recording_shortcut::disarm_revert())
+        .await;
+        recording_shortcut::after_revert(result, recording_shortcut::disarm_revert)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2013,6 +2012,14 @@ fn quill_picker_open() -> Result<(), String> {
 fn quill_picker_close() {
     #[cfg(target_os = "macos")]
     recording_shortcut::quill_picker_close();
+}
+
+/// Opens the revert window for a dictation rewrite once its delivery opened the slot, so a
+/// rewrite that lands after the frontend guard or a failed delivery arms nothing.
+#[tauri::command]
+fn quill_revert_arm() {
+    #[cfg(target_os = "macos")]
+    recording_shortcut::arm_revert();
 }
 
 /// The clipboard as `quill_clipboard_hold` and `quill_clipboard_release` see it.
@@ -2833,6 +2840,7 @@ pub fn run() {
             quill_picker_close,
             quill_clipboard_hold,
             quill_clipboard_release,
+            quill_revert_arm,
             worker_ping,
             worker_list_models,
             worker_start_session,

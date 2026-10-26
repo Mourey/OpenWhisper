@@ -931,6 +931,12 @@ pub(crate) fn disarm_revert() {
     }
 }
 
+/// Runs `disarm` after a revert whatever its result, so a failed revert leaves no hotkey.
+pub(crate) fn after_revert<R>(result: R, disarm: impl FnOnce()) -> R {
+    disarm();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1582,5 +1588,16 @@ mod tests {
             Ok(())
         }));
         assert_eq!(*released.borrow(), 1, "the window was still armed after both presses");
+    }
+
+    #[test]
+    fn quill_revert_hotkey_after_revert_disarms_on_success_and_on_failure() {
+        let disarmed = RefCell::new(0);
+        let ok: Result<&str, &str> = after_revert(Ok("inserted"), || *disarmed.borrow_mut() += 1);
+        assert_eq!(ok, Ok("inserted"));
+        assert_eq!(*disarmed.borrow(), 1);
+        let failed: Result<&str, &str> = after_revert(Err("target_changed"), || *disarmed.borrow_mut() += 1);
+        assert_eq!(failed, Err("target_changed"));
+        assert_eq!(*disarmed.borrow(), 2, "a failed revert left the revert hotkey armed");
     }
 }

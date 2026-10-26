@@ -176,4 +176,28 @@ describe("quill-revert-slot", () => {
     expect(countdown).toContain('aria-hidden="true"');
     expect(main).toContain("quillRevertCountdown.textContent = view.countdown");
   });
+
+  it("arms the revert hotkey for a dictation rewrite only when its slot opens", async () => {
+    for (const delivered of ["inserted", "copied", "failed"] as const) {
+      const h = slotHarness();
+      await settleDictationRewrite({ invoke: h.invoke, rewriteId: "r-d", delivered, pasted: "text", slot: h.slot, name: "Dictation cleanup" });
+      const arms = h.calls.filter((call) => call.cmd === "quill_revert_arm");
+      expect(arms).toEqual(delivered === "failed" ? [] : [{ cmd: "quill_revert_arm", args: undefined }]);
+      expect(h.slot.view().visible).toBe(delivered !== "failed");
+    }
+  });
+
+  it("arms natively only after a hotkey rewrite, and disarms after every revert", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`async fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    expect(body("quill_rewrite_selection")).toContain("recording_shortcut::arm_revert()");
+    expect(body("quill_rewrite_text")).not.toContain("arm_revert");
+    expect(body("quill_revert")).toContain("recording_shortcut::after_revert(");
+    expect(body("quill_revert")).not.toContain(".inspect(|_| recording_shortcut::disarm_revert())");
+    expect(lib).toMatch(/^\s+quill_revert_arm,$/m);
+  });
 });

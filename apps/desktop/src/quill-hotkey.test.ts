@@ -172,6 +172,30 @@ describe("quill-press-window", () => {
     expect(h.picker.isOpen).toBe(true);
     expect(h.notices).toEqual([]);
   });
+
+  it("releases the picker keys when the catalog lists no modes", async () => {
+    const calls: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      return cmd === "quill_list_modes" ? { modes: [] } : null;
+    });
+    const picker = new QuillPicker({ announce: () => {} });
+    const hotkey = new QuillHotkey({
+      invoke,
+      catalog: new QuillCatalog(invoke),
+      picker,
+      storedDefault: () => "task-claude",
+      notify: () => {},
+      onRewritten: () => {},
+    });
+    hotkey.press();
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(picker.isOpen).toBe(false);
+    expect(calls.filter((cmd) => cmd === "quill_picker_open")).toHaveLength(1);
+    expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
+    expect(calls.lastIndexOf("quill_picker_close")).toBeGreaterThan(calls.indexOf("quill_picker_open"));
+  });
 });
 
 describe("quill-error-contract", () => {
