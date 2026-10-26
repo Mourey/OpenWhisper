@@ -9,6 +9,7 @@ import {
   QuillHotkey,
   QuillPicker,
   hotkeySlotAllowed,
+  quillSettingsFromRust,
   quillLogLine,
   quillNotice,
   toQuillCommandError,
@@ -403,6 +404,55 @@ describe("quill-press-window", () => {
     expect(hotkeySlotAllowed({ quillEnabled: false })).toBe(false);
     expect(hotkeySlotAllowed({ quillEnabled: true, quillCommandError: null })).toBe(true);
     expect(hotkeySlotAllowed({ quillEnabled: true, quillCommandError: "not executable" })).toBe(false);
+  });
+
+  it("decides the hotkey slot on settings read after the rewrite, so a save that landed mid-rewrite keeps it closed", async () => {
+    const cases: { read: () => Promise<object>; last: boolean; opens: boolean }[] = [
+      { read: async () => ({ quillEnabled: false }), last: true, opens: false },
+      { read: async () => ({ quillEnabled: true, quillCommandError: "not executable" }), last: true, opens: false },
+      { read: async () => ({ quillEnabled: true, quillCommandError: null }), last: false, opens: true },
+      { read: async () => { throw new Error("ipc"); }, last: true, opens: true },
+      { read: async () => { throw new Error("ipc"); }, last: false, opens: false },
+    ];
+    for (const { read, last, opens } of cases) {
+      const calls: string[] = [];
+      const rewritten: string[] = [];
+      const invoke = vi.fn(async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "quill_list_modes") return { modes: MODES };
+        return cmd === "quill_rewrite_selection" ? REWRITE_RESULT : null;
+      });
+      const hotkey = new QuillHotkey({
+        invoke,
+        catalog: new QuillCatalog(invoke),
+        picker: new QuillPicker({ announce: () => {} }),
+        storedDefault: () => "task-claude",
+        notify: () => {},
+        onRewritten: (rewrite) => rewritten.push(rewrite.rewriteId),
+        hookReady: () => last,
+        readSettings: () => {
+          calls.push("readSettings");
+          return read();
+        },
+      });
+      hotkey.press();
+      await vi.advanceTimersByTimeAsync(600);
+      expect(calls.indexOf("readSettings")).toBeGreaterThan(calls.indexOf("quill_rewrite_selection"));
+      expect(rewritten).toEqual(opens ? [REWRITE_RESULT.rewriteId] : []);
+    }
+  });
+
+  it("reads settings from Rust for the hotkey slot and lets only Rust's settings close an open slot", () => {
+    expect(quillSettingsFromRust({})).toBe(false);
+    expect(quillSettingsFromRust({ quillEnabled: false })).toBe(true);
+    expect(quillSettingsFromRust({ quillEnabled: true })).toBe(true);
+    const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+    const wiring = main.slice(main.indexOf("const quillHotkey = new QuillHotkey({"), main.indexOf("});", main.indexOf("const quillHotkey = new QuillHotkey({")));
+    expect(wiring).toContain('readSettings: () => invoke<AppSettings>("app_get_settings"),');
+    const sync = main.slice(main.indexOf("function syncQuillSettingsUi("), main.indexOf("\n}\n", main.indexOf("function syncQuillSettingsUi(")));
+    const notReady = sync.indexOf("if (!quillHookReady(settings)) {");
+    const branch = sync.slice(notReady, sync.indexOf("} else if", notReady));
+    expect(branch).toContain("if (quillSettingsFromRust(settings)) quillSlot.close();");
   });
 });
 

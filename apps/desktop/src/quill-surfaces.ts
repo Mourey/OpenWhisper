@@ -203,8 +203,13 @@ export function quillHookReady(settings: QuillSettingsView) {
  * quill fields) it defers to that; afterwards it follows the hook state Rust last reported.
  */
 export function hotkeySlotAllowed(settings: QuillSettingsView | null) {
-  if (!settings || settings.quillEnabled === undefined) return true;
+  if (!settings || !quillSettingsFromRust(settings)) return true;
   return quillHookReady(settings);
+}
+
+/** Whether these settings came from Rust; the load-failure fallback carries no quill fields. */
+export function quillSettingsFromRust(settings: QuillSettingsView) {
+  return settings.quillEnabled !== undefined;
 }
 
 export function dictationCleanupEffective(settings: QuillSettingsView) {
@@ -429,6 +434,8 @@ export class QuillHotkey {
     onRewritten: (rewrite: QuillRewritten) => void;
     /** Whether the hook is on with a valid command; while not, a rewrite opens no revert slot. */
     hookReady?: () => boolean;
+    /** Reads settings from Rust after a rewrite, so the slot follows what Rust decided when arming. */
+    readSettings?: () => Promise<QuillSettingsView>;
     log?: (line: string) => void;
     timers?: Timers;
   }) {
@@ -489,6 +496,22 @@ export class QuillHotkey {
     }
   }
 
+  /**
+   * Rust re-checks the hook under the save lock before arming, and a save writes its settings
+   * under the same lock, so settings read after the rewrite show what Rust decided; a save after
+   * the read closes the slot through the settings sync. A failed read falls back to the last state.
+   */
+  private async slotAllowed() {
+    if (this.deps.readSettings) {
+      try {
+        return hotkeySlotAllowed(await this.deps.readSettings());
+      } catch {
+        // Fall back to the last settings the frontend holds.
+      }
+    }
+    return this.deps.hookReady?.() !== false;
+  }
+
   /** Releases the native picker keys; a failure is logged, never shown as an alert. */
   private releasePickerKeys() {
     return this.deps.invoke("quill_picker_close").catch((error) => this.fail("picker_close_failed", error, false));
@@ -504,7 +527,7 @@ export class QuillHotkey {
       const result = (await this.deps.invoke("quill_rewrite_selection", { mode, pressedAtMs })) as RewriteSelectionResult;
       // Rust arms the revert hotkey only while the hook is ready, so a slot opened otherwise
       // would only offer a revert that fails with `disabled`.
-      if (this.deps.hookReady?.() !== false) {
+      if (await this.slotAllowed()) {
         this.deps.onRewritten({ rewriteId: result.rewriteId, name: modeName(modes, result.mode), delivered: "inserted" });
       }
       if (result.clipboardReplaced) this.deps.notify(QUILL_CLIPBOARD_REPLACED, "status");

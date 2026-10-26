@@ -56,6 +56,7 @@ import {
   modeName,
   quillHookReady,
   hotkeySlotAllowed,
+  quillSettingsFromRust,
   quillLogLine,
   quillNoticeDurationMs,
   recordingStartBlocked,
@@ -789,6 +790,7 @@ const quillHotkey = new QuillHotkey({
   notify: showQuillNotice,
   onRewritten: (rewrite) => quillSlot.open(rewrite),
   hookReady: () => hotkeySlotAllowed(quillSettings),
+  readSettings: () => invoke<AppSettings>("app_get_settings"),
   log: (line) => logDebug(line),
 });
 
@@ -2279,8 +2281,9 @@ function syncQuillSettingsUi(settings: AppSettings) {
   if (!quillHookReady(settings)) {
     quillCatalog.clear();
     quillPicker.dismiss("picker_settings_close_failed");
-    // The save that made the hook not ready also disarmed the revert hotkey.
-    quillSlot.close();
+    // The save that made the hook not ready also disarmed the revert hotkey; the load-failure
+    // fallback says nothing about Rust, so it leaves an open slot alone.
+    if (quillSettingsFromRust(settings)) quillSlot.close();
   } else if (!previous || !quillHookReady(previous) || previous.quillCommand !== settings.quillCommand) {
     quillCatalog.clear();
   }
