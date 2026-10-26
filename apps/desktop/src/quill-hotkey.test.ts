@@ -251,6 +251,34 @@ describe("quill-press-window", () => {
     expect(notices).toEqual([]);
     expect(logs).toEqual([quillLogLine("picker_close_failed", "transport")]);
   });
+
+  it("releases the picker keys once when the picker fails to render on open", async () => {
+    const calls: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      return cmd === "quill_list_modes" ? { modes: MODES } : null;
+    });
+    const picker = new QuillPicker({
+      announce: () => {},
+      render: () => {
+        throw new Error("render failed");
+      },
+    });
+    const hotkey = new QuillHotkey({
+      invoke,
+      catalog: new QuillCatalog(invoke),
+      picker,
+      storedDefault: () => "task-claude",
+      notify: () => {},
+      onRewritten: () => {},
+    });
+    hotkey.press();
+    hotkey.press();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(picker.isOpen).toBe(false);
+    expect(calls.filter((cmd) => cmd === "quill_picker_close")).toHaveLength(1);
+    expect(calls.lastIndexOf("quill_picker_close")).toBeGreaterThan(calls.indexOf("quill_picker_open"));
+  });
 });
 
 describe("quill-error-contract", () => {

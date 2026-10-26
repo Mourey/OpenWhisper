@@ -486,6 +486,8 @@ pub(crate) struct Quill {
     revert: RevertState,
     revert_generation: u64,
     revert_deadline: Option<Instant>,
+    /// The rewrite whose revert the window serves, so a revert of another rewrite leaves it.
+    revert_rewrite: Option<String>,
 }
 
 /// Work the handler or a command hands to a spawned task.
@@ -519,6 +521,7 @@ impl Quill {
             revert: RevertState::Off,
             revert_generation: 0,
             revert_deadline: None,
+            revert_rewrite: None,
         }
     }
 
@@ -673,6 +676,8 @@ fn revert_arm(
         if state.revert != RevertState::Off {
             return Ok(arm(&mut state));
         }
+        // A new window: a late revert that read the generation before this must not close it.
+        state.revert_generation += 1;
         state.revert = RevertState::Arming;
     }
     let registered = register(quill_revert_shortcut());
@@ -680,6 +685,7 @@ fn revert_arm(
     if let Err(error) = registered {
         state.revert = RevertState::Off;
         state.revert_deadline = None;
+        state.revert_rewrite = None;
         return Err(error);
     }
     if state.revert != RevertState::Arming {
@@ -703,9 +709,24 @@ fn revert_disarm(
     revert_disarm_since(quill, None, unregister)
 }
 
-/// The revert window's generation, which every arm and disarm moves.
+/// The revert window's generation, which every claim, arm, disarm and expiry moves.
 fn revert_generation(quill: &Mutex<Quill>) -> Option<u64> {
     quill.lock().ok().map(|state| state.revert_generation)
+}
+
+/// Gives the revert window to `rewrite_id` before it is armed for that rewrite.
+fn revert_claim(quill: &Mutex<Quill>, rewrite_id: &str) {
+    if let Ok(mut state) = quill.lock() {
+        state.revert_rewrite = Some(rewrite_id.to_string());
+        state.revert_generation += 1;
+    }
+}
+
+/// Whether the revert window was last claimed for `rewrite_id` and is still open.
+fn revert_owned_by(quill: &Mutex<Quill>, rewrite_id: &str) -> bool {
+    quill
+        .lock()
+        .is_ok_and(|state| state.revert_rewrite.as_deref() == Some(rewrite_id))
 }
 
 /// Closes the revert window unless it was armed or disarmed after `generation`, so a late
@@ -724,6 +745,7 @@ fn revert_disarm_since(
         }
         state.revert_generation += 1;
         state.revert_deadline = None;
+        state.revert_rewrite = None;
         match state.revert {
             RevertState::Off => return false,
             RevertState::Arming => {
@@ -780,6 +802,8 @@ fn run_deferred(
                 }
                 state.revert = RevertState::Off;
                 state.revert_deadline = None;
+                state.revert_rewrite = None;
+                state.revert_generation += 1;
             }
             let _ = unregister(quill_revert_shortcut());
             1
@@ -946,6 +970,17 @@ pub(crate) fn arm_revert() {
 /// The revert window's generation as `quill_revert` starts, for `disarm_revert`.
 pub(crate) fn revert_generation_now() -> Option<u64> {
     revert_generation(&QUILL)
+}
+
+/// Gives the revert window to `rewrite_id`; call it just before `arm_revert`.
+pub(crate) fn claim_revert(rewrite_id: &str) {
+    revert_claim(&QUILL, rewrite_id);
+}
+
+/// Whether the revert window still serves `rewrite_id`. Read it after
+/// `revert_generation_now`, so a claim between the two reads shows as another owner.
+pub(crate) fn revert_window_is_for(rewrite_id: &str) -> bool {
+    revert_owned_by(&QUILL, rewrite_id)
 }
 
 /// Closes the revert window after `quill_revert`, unless a newer rewrite armed it after
@@ -1654,5 +1689,60 @@ mod tests {
         }));
         assert_eq!(*released.borrow(), 1);
         assert!(!revert_disarm_since(&quill, None, |_| panic!("already released")));
+    }
+
+    #[test]
+    fn quill_revert_hotkey_arming_and_expiry_move_the_generation() {
+        let quill = Mutex::new(Quill::new());
+        let start = Instant::now();
+        let before = revert_generation(&quill);
+        revert_arm(&quill, start, |_| {
+            assert_ne!(revert_generation(&quill), before, "arming did not move the generation");
+            Ok(())
+        })
+        .map(|timer| {
+            let armed = revert_generation(&quill);
+            quill_released(&quill, timer, start + QUILL_REVERT_WINDOW);
+            assert_ne!(revert_generation(&quill), armed, "expiry did not move the generation");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn quill_revert_hotkey_late_revert_across_expiry_leaves_a_registering_window() {
+        let quill = Mutex::new(Quill::new());
+        let start = Instant::now();
+        let old = revert_arm(&quill, start, |_| Ok(())).unwrap();
+        let reverting = revert_generation(&quill);
+        let expired = start + QUILL_REVERT_WINDOW;
+        assert_eq!(quill_released(&quill, old, expired), vec![quill_revert_id()]);
+        let late_disarm = RefCell::new(None);
+        let fresh = revert_arm(&quill, expired, |_| {
+            *late_disarm.borrow_mut() =
+                Some(revert_disarm_since(&quill, reverting, |_| panic!("released while registering")));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*late_disarm.borrow(), Some(false));
+        assert!(quill_released(&quill, fresh.clone(), expired).is_empty(), "the new window closed at once");
+        assert_eq!(quill_released(&quill, fresh, expired + QUILL_REVERT_WINDOW), vec![quill_revert_id()]);
+    }
+
+    #[test]
+    fn quill_revert_hotkey_window_belongs_to_the_latest_claimed_rewrite() {
+        let quill = Mutex::new(Quill::new());
+        let start = Instant::now();
+        revert_claim(&quill, "rewrite-x");
+        revert_arm(&quill, start, |_| Ok(())).unwrap();
+        assert!(revert_owned_by(&quill, "rewrite-x"));
+        let reverting_x = revert_generation(&quill);
+        revert_claim(&quill, "rewrite-y");
+        assert!(!revert_owned_by(&quill, "rewrite-x"), "an older rewrite still owns the window");
+        assert!(revert_owned_by(&quill, "rewrite-y"));
+        assert_ne!(revert_generation(&quill), reverting_x, "claiming did not move the generation");
+        revert_arm(&quill, start + Duration::from_secs(1), |_| panic!("already registered")).unwrap();
+        assert!(revert_owned_by(&quill, "rewrite-y"));
+        assert!(revert_disarm(&quill, |_| Ok(())));
+        assert!(!revert_owned_by(&quill, "rewrite-y"), "a closed window has no owner");
     }
 }

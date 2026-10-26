@@ -206,6 +206,38 @@ describe("quill-picker-model", () => {
     expect(announced).toEqual([]);
     expect(runs).toEqual([]);
   });
+
+  it("releases the picker keys even when the close fails to render", () => {
+    let fail = false;
+    let closes = 0;
+    const picker = new QuillPicker({
+      announce: () => {},
+      onClose: () => { closes += 1; },
+      render: () => {
+        if (fail) throw new Error("render failed");
+      },
+    });
+    picker.open(TEN_MODES, "task-claude");
+    fail = true;
+    expect(() => picker.close()).toThrow("render failed");
+    expect(picker.isOpen).toBe(false);
+    expect(closes).toBe(1);
+  });
+
+  it("stays closed with no timer when the open fails to render", async () => {
+    let closes = 0;
+    const picker = new QuillPicker({
+      announce: () => {},
+      onClose: () => { closes += 1; },
+      render: () => {
+        throw new Error("render failed");
+      },
+    });
+    expect(() => picker.open(TEN_MODES, "task-claude")).toThrow("render failed");
+    expect(picker.isOpen).toBe(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(closes).toBe(0);
+  });
 });
 
 describe("quill-picker-markup", () => {

@@ -182,7 +182,7 @@ describe("quill-revert-slot", () => {
       const h = slotHarness();
       await settleDictationRewrite({ invoke: h.invoke, rewriteId: "r-d", delivered, pasted: "text", slot: h.slot, name: "Dictation cleanup" });
       const arms = h.calls.filter((call) => call.cmd === "quill_revert_arm");
-      expect(arms).toEqual(delivered === "failed" ? [] : [{ cmd: "quill_revert_arm", args: undefined }]);
+      expect(arms).toEqual(delivered === "failed" ? [] : [{ cmd: "quill_revert_arm", args: { rewriteId: "r-d" } }]);
       expect(h.slot.view().visible).toBe(delivered !== "failed");
     }
   });
@@ -209,5 +209,27 @@ describe("quill-revert-slot", () => {
     expect(captured).toBeGreaterThan(0);
     expect(captured).toBeLessThan(body.indexOf("with_quill("));
     expect(body).toContain("recording_shortcut::disarm_revert(reverting)");
+  });
+
+  it("disarms only a revert window that still belongs to the reverted rewrite", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const body = (name: string) => {
+      const start = lib.indexOf(`fn ${name}(`);
+      expect(start).toBeGreaterThan(0);
+      return lib.slice(start, lib.indexOf("#[tauri::command]", start));
+    };
+    const revert = body("quill_revert");
+    const generation = revert.indexOf("let reverting = recording_shortcut::revert_generation_now();");
+    const owned = revert.indexOf("let owned = recording_shortcut::revert_window_is_for(&rewrite_id);");
+    expect(generation).toBeGreaterThan(0);
+    expect(owned).toBeGreaterThan(generation);
+    expect(owned).toBeLessThan(revert.indexOf("with_quill("));
+    expect(revert).toMatch(/if owned \{\s+recording_shortcut::disarm_revert\(reverting\)/);
+    for (const [name, id] of [["quill_rewrite_selection", "&result.rewrite_id"], ["quill_revert_arm", "&rewrite_id"]]) {
+      const arm = body(name);
+      const claim = arm.indexOf(`recording_shortcut::claim_revert(${id});`);
+      expect(claim).toBeGreaterThan(0);
+      expect(claim).toBeLessThan(arm.indexOf("recording_shortcut::arm_revert()"));
+    }
   });
 });

@@ -270,9 +270,19 @@ export class QuillPicker {
     this.defaultId = defaultId;
     this.highlighted = Math.max(0, this.rows.findIndex((entry) => entry.id === defaultId));
     this.isOpen = true;
-    this.restartTimer();
-    this.deps.announce(`Rewrite modes open. ${this.highlightText()}`);
-    this.render();
+    let shown = false;
+    try {
+      this.restartTimer();
+      this.deps.announce(`Rewrite modes open. ${this.highlightText()}`);
+      this.render();
+      shown = true;
+    } finally {
+      // A failed open stays closed with no timer; the caller releases the keys it registered.
+      if (!shown) {
+        this.isOpen = false;
+        this.clearTimer();
+      }
+    }
   }
 
   key(key: QuillPickerKey) {
@@ -302,9 +312,12 @@ export class QuillPicker {
     if (!this.isOpen) return;
     this.isOpen = false;
     this.clearTimer();
-    this.deps.announce("Rewrite modes closed");
-    this.render();
-    this.onClose();
+    try {
+      this.deps.announce("Rewrite modes closed");
+      this.render();
+    } finally {
+      this.onClose();
+    }
   }
 
   view(): QuillPickerView {
@@ -560,7 +573,7 @@ export async function settleDictationRewrite(options: {
     options.log?.(quillLogLine("report_outcome_failed", toQuillCommandError(error).code));
   });
   if (options.slot && delivered !== "failed") {
-    await invoke("quill_revert_arm").catch((error) => {
+    await invoke("quill_revert_arm", { rewriteId }).catch((error) => {
       options.log?.(quillLogLine("revert_arm_failed", toQuillCommandError(error).code));
     });
     options.slot.open({ rewriteId, name: options.name ?? rewriteId, delivered });
