@@ -312,4 +312,21 @@ describe("quill-revert-slot", () => {
     for (const write of ["claim_revert", "arm_revert", "disarm_revert"]) expect(body).not.toContain(write);
     expect(lib).toMatch(/^\s+quill_revert_armed,$/m);
   });
+
+  it("keeps the revert-armed query to its own body: the save lock, then the read, and nothing else", () => {
+    const lib = readFileSync(resolve(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    const start = lib.indexOf("async fn quill_revert_armed(");
+    expect(start).toBeGreaterThan(0);
+    const end = lib.indexOf("\n}\n", start);
+    expect(end).toBeGreaterThan(start);
+    const body = lib.slice(start, end);
+    expect(body).not.toContain("\nfn ");
+    const macos = body.slice(body.indexOf('#[cfg(target_os = "macos")]'), body.indexOf('#[cfg(not(target_os = "macos"))]'));
+    const locked = macos.indexOf("let _update = state.settings_update.lock().await;");
+    const read = macos.indexOf("Ok(recording_shortcut::revert_window_is_for(&rewrite_id))");
+    expect(locked).toBeGreaterThan(0);
+    expect(read).toBeGreaterThan(locked);
+    expect(macos.trim().split("\n").filter((line) => line.trim() && !line.trim().startsWith("//"))).toHaveLength(5);
+    for (const write of ["claim_revert", "arm_revert", "disarm_revert", "settings.lock()", "save_settings"]) expect(body).not.toContain(write);
+  });
 });

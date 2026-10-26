@@ -499,11 +499,12 @@ export class QuillHotkey {
   }
 
   /**
-   * Rust re-checks the hook under the save lock before arming, and a save writes its settings
-   * and disarms under the same lock. The read does not take that lock, so it shows settings as of
-   * the read, not as of Rust's decision: a save before the re-check or between it and the read is
-   * seen, and a save after the read closes the slot through the settings sync. A failed read falls
-   * back to the last state.
+   * Whether a successful hotkey rewrite opens its revert slot. First it asks Rust whether the
+   * revert window serves this rewrite (`quill_revert_armed`, under the save lock, so a save's
+   * disarm is either seen or still to come), and the last settings veto a save whose reply came
+   * first; a save after that closes the slot through the settings sync. If the query fails it
+   * reads settings instead: that read does not take the save lock, so it shows settings as of the
+   * read, not as of Rust's decision. If the read fails too, the last settings decide.
    */
   private async slotAllowed(rewriteId: string) {
     if (this.deps.revertArmed) {
