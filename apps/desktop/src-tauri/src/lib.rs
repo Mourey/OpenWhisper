@@ -770,6 +770,69 @@ fn apply_quill_command(settings: &mut AppSettings, requested: Option<String>) {
     }
 }
 
+fn default_quill_default_mode() -> String {
+    "task-claude".to_string()
+}
+
+/// The configured quill command's validation string, `None` when it passes.
+fn quill_command_error(settings: &AppSettings) -> Option<String> {
+    quill_client::validate_quill_command(&settings.quill_command, &NativeFs).err()
+}
+
+/// Applies the quill options of a save. A default mode must be 1 to 64 characters of
+/// `[a-z0-9-]`; a refused value changes nothing.
+fn apply_quill_settings(
+    settings: &mut AppSettings,
+    default_mode: Option<String>,
+    dictation_cleanup: Option<bool>,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    if let Some(mode) = &default_mode {
+        let valid = (1..=64).contains(&mode.len())
+            && mode
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid {
+            return Err("A quill mode id is 1 to 64 characters of a-z, 0-9 and -.".to_string());
+        }
+    }
+    if let Some(mode) = default_mode {
+        settings.quill_default_mode = mode;
+    }
+    if let Some(cleanup) = dictation_cleanup {
+        settings.quill_dictation_cleanup = cleanup;
+    }
+    if let Some(enabled) = enabled {
+        settings.quill_enabled = enabled;
+    }
+    Ok(())
+}
+
+/// Applies the "Also copy dictations to clipboard" option of a save; `None` keeps the stored
+/// value. It depends on no quill setting.
+fn apply_dictation_copy(settings: &mut AppSettings, requested: Option<bool>) {
+    if let Some(copy) = requested {
+        settings.copy_dictations_to_clipboard = copy;
+    }
+}
+
+/// Dictation cleanup runs only while the hook is on, its command validated and cleanup is on.
+fn cleanup_effective(settings: &AppSettings, command_error: Option<&str>) -> bool {
+    settings.quill_enabled && command_error.is_none() && settings.quill_dictation_cleanup
+}
+
+/// The model that streams text to the target, which quill does not rewrite.
+fn model_streams(model: &str) -> bool {
+    model == "gpt-realtime-transcribe"
+}
+
+/// The `refine_enabled` sent to `start_session`: as today, and off where quill cleans up.
+fn session_refine_enabled(settings: &AppSettings, command_error: Option<&str>) -> bool {
+    refinement_enabled_for_model(&settings.transcription_model, settings.refine_enabled)
+        && !(cleanup_effective(settings, command_error)
+            && !model_streams(&settings.transcription_model))
+}
+
 fn hold_to_talk_for_shortcut(shortcut: &str, requested: bool) -> bool {
     requested || (cfg!(target_os = "macos") && shortcut == "RightControl")
 }
@@ -795,6 +858,14 @@ struct AppSettings {
     recording_shortcut: String,
     #[serde(default = "default_quill_command")]
     quill_command: String,
+    #[serde(default = "default_quill_default_mode")]
+    quill_default_mode: String,
+    #[serde(default)]
+    quill_dictation_cleanup: bool,
+    #[serde(default)]
+    quill_enabled: bool,
+    #[serde(default)]
+    copy_dictations_to_clipboard: bool,
 }
 
 impl Default for AppSettings {
@@ -809,6 +880,10 @@ impl Default for AppSettings {
             hold_to_talk: true,
             recording_shortcut: default_recording_shortcut(),
             quill_command: default_quill_command(),
+            quill_default_mode: default_quill_default_mode(),
+            quill_dictation_cleanup: false,
+            quill_enabled: false,
+            copy_dictations_to_clipboard: false,
         }
     }
 }
@@ -827,7 +902,11 @@ struct FrontendSettings {
     recording_shortcut: String,
     recording_shortcut_error: Option<String>,
     quill_command: String,
+    quill_default_mode: String,
+    quill_dictation_cleanup: bool,
+    quill_enabled: bool,
     quill_command_error: Option<String>,
+    copy_dictations_to_clipboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,7 +1207,11 @@ fn frontend_settings_from(settings: &AppSettings) -> FrontendSettings {
         recording_shortcut: settings.recording_shortcut.clone(),
         recording_shortcut_error: None,
         quill_command: settings.quill_command.clone(),
+        quill_default_mode: settings.quill_default_mode.clone(),
+        quill_dictation_cleanup: settings.quill_dictation_cleanup,
+        quill_enabled: settings.quill_enabled,
         quill_command_error: None,
+        copy_dictations_to_clipboard: settings.copy_dictations_to_clipboard,
     }
 }
 
@@ -1577,6 +1660,10 @@ async fn app_save_settings(
     hold_to_talk: Option<bool>,
     recording_shortcut: Option<String>,
     quill_command: Option<String>,
+    quill_default_mode: Option<String>,
+    quill_dictation_cleanup: Option<bool>,
+    quill_enabled: Option<bool>,
+    copy_dictations_to_clipboard: Option<bool>,
 ) -> Result<FrontendSettings, String> {
     let _update = state.settings_update.lock().await;
     let shortcut_requested = recording_shortcut.is_some();
@@ -1621,6 +1708,13 @@ async fn app_save_settings(
             current.recording_shortcut = shortcut;
         }
         apply_quill_command(&mut current, quill_command);
+        apply_quill_settings(
+            &mut current,
+            quill_default_mode,
+            quill_dictation_cleanup,
+            quill_enabled,
+        )?;
+        apply_dictation_copy(&mut current, copy_dictations_to_clipboard);
         current.hold_to_talk =
             hold_to_talk_for_shortcut(&current.recording_shortcut, current.hold_to_talk);
         current.refine_enabled =
@@ -1657,6 +1751,25 @@ async fn app_save_settings(
     if worker_settings_changed(&previous, &updated) {
         let mut worker = state.worker.lock().await;
         *worker = None;
+    }
+
+    if previous.quill_enabled != updated.quill_enabled {
+        let quill_state = state.inner().clone();
+        let enabled = updated.quill_enabled;
+        tauri::async_runtime::spawn(async move {
+            if !enabled {
+                *quill_state.quill.lock().await = None;
+                return;
+            }
+            let Ok(runtime) = QuillRuntime::from_state(&quill_state) else {
+                return;
+            };
+            if let Err(error) =
+                quill_client::spawn_into_slot(&quill_state.quill, &runtime.command, &runtime.env()).await
+            {
+                debug_log_line("quill", &quill_client::quill_event_line("enable_spawn_failed", error.code));
+            }
+        });
     }
 
     frontend_settings_with_runtime(&state, &updated)
@@ -1707,9 +1820,29 @@ async fn with_quill<T>(
     state: &AppState,
     f: impl for<'a> FnOnce(&'a Mutex<Option<QuillClient>>, &'a str, &'a QuillEnv<'a>) -> QuillFuture<'a, T>,
 ) -> Result<T, QuillCommandError> {
+    if !quill_hook_enabled(state)? {
+        return Err(quill_hook_off());
+    }
     let runtime = QuillRuntime::from_state(state)?;
     let env = runtime.env();
     f(&state.quill, &runtime.command, &env).await
+}
+
+#[cfg(target_os = "macos")]
+fn quill_hook_enabled(state: &AppState) -> Result<bool, QuillCommandError> {
+    Ok(state
+        .settings
+        .lock()
+        .map_err(|_| QuillCommandError::transport("Failed to lock settings"))?
+        .quill_enabled)
+}
+
+#[cfg(target_os = "macos")]
+fn quill_hook_off() -> QuillCommandError {
+    QuillCommandError::new(
+        quill_client::QuillErrorCode::Disabled,
+        "Quill is turned off. Turn on Rewrite with quill in Settings.",
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1865,6 +1998,117 @@ async fn quill_list_modes(
     }
 }
 
+/// The clipboard as `quill_clipboard_hold` and `quill_clipboard_release` see it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+trait QuillClipboard {
+    /// The plain text on the clipboard, `None` when it holds no text.
+    fn text(&mut self) -> Option<String>;
+    fn set_text(&mut self, text: &str) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+struct NativeClipboard(arboard::Clipboard);
+
+#[cfg(target_os = "macos")]
+impl QuillClipboard for NativeClipboard {
+    fn text(&mut self) -> Option<String> {
+        self.0.get_text().ok()
+    }
+
+    fn set_text(&mut self, text: &str) -> bool {
+        self.0.set_text(text).is_ok()
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const QUILL_CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The plain-text clipboard saved by `quill_clipboard_hold` until `quill_clipboard_release`.
+#[cfg(target_os = "macos")]
+static QUILL_CLIPBOARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Saves the plain-text clipboard in `slot`, replacing what an earlier hold saved. A
+/// clipboard without text, or none at all, saves nothing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quill_clipboard_hold_with<C: QuillClipboard>(
+    slot: &std::sync::Mutex<Option<String>>,
+    clipboard: Option<&mut C>,
+) -> Result<(), String> {
+    let saved = clipboard.and_then(|clipboard| clipboard.text());
+    *slot
+        .lock()
+        .map_err(|_| "Failed to lock the clipboard hold".to_string())? = saved;
+    Ok(())
+}
+
+/// Empties `slot`; then, when `restore` is true, waits the restore delay and writes the
+/// saved text back only if the clipboard still holds `pasted`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn quill_clipboard_release_with<C, F, S, M>(
+    slot: &std::sync::Mutex<Option<String>>,
+    restore: bool,
+    pasted: &str,
+    sleep: S,
+    clipboard: M,
+) -> Result<(), String>
+where
+    C: QuillClipboard,
+    F: std::future::Future<Output = ()>,
+    S: FnOnce(std::time::Duration) -> F,
+    M: FnOnce() -> Option<C>,
+{
+    let saved = slot
+        .lock()
+        .map_err(|_| "Failed to lock the clipboard hold".to_string())?
+        .take();
+    let Some(saved) = saved.filter(|_| restore) else {
+        return Ok(());
+    };
+    sleep(QUILL_CLIPBOARD_RESTORE_DELAY).await;
+    let Some(mut clipboard) = clipboard() else {
+        return Ok(());
+    };
+    if clipboard.text().as_deref() == Some(pasted) {
+        clipboard.set_text(&saved);
+    }
+    Ok(())
+}
+
+/// Saves the plain-text clipboard natively before a quill delivery. Returns nothing, so the
+/// clipboard never reaches the webview.
+#[tauri::command]
+fn quill_clipboard_hold() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut clipboard = arboard::Clipboard::new().ok().map(NativeClipboard);
+        quill_clipboard_hold_with(&QUILL_CLIPBOARD, clipboard.as_mut())
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(())
+}
+
+/// Ends the hold: restores the saved clipboard 300 ms after an inserted paste when the
+/// clipboard still holds `pasted`, and always empties the slot.
+#[tauri::command]
+async fn quill_clipboard_release(restore: bool, pasted: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        quill_clipboard_release_with(
+            &QUILL_CLIPBOARD,
+            restore,
+            &pasted,
+            tokio::time::sleep,
+            || arboard::Clipboard::new().ok().map(NativeClipboard),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (restore, pasted);
+        Ok(())
+    }
+}
+
 #[tauri::command]
 async fn worker_ping(
     app_handle: AppHandle,
@@ -1894,7 +2138,7 @@ async fn worker_start_session(
             .map_err(|_| "Failed to lock settings".to_string())?;
         (
             s.transcription_prompt.clone(),
-            refinement_enabled_for_model(&s.transcription_model, s.refine_enabled),
+            session_refine_enabled(&s, quill_command_error(&s).as_deref()),
             s.refine_prompt.clone(),
         )
     };
@@ -2442,6 +2686,11 @@ pub fn run() {
                     .map_err(|_| anyhow!("Failed to lock settings during setup"))?;
                 *settings = loaded;
             }
+            let quill_enabled = state
+                .settings
+                .lock()
+                .map_err(|_| anyhow!("Failed to lock settings during setup"))?
+                .quill_enabled;
 
             // There is no enable setting yet, so nothing is enabled at setup and the client
             // starts on the first command; the setting replaces `false` later.
@@ -2454,7 +2703,7 @@ pub fn run() {
                     .clone();
                 quill_client::validate_quill_command(&command, &NativeFs)
             };
-            if quill_client::quill_should_spawn_at_setup(false, &quill_validation) {
+            if quill_client::quill_should_spawn_at_setup(quill_enabled, &quill_validation) {
                 let quill_state = state.inner().clone();
                 tauri::async_runtime::spawn(async move {
                     let Ok(runtime) = QuillRuntime::from_state(&quill_state) else {
@@ -2565,6 +2814,8 @@ pub fn run() {
             quill_revert,
             quill_report_outcome,
             quill_list_modes,
+            quill_clipboard_hold,
+            quill_clipboard_release,
             worker_ping,
             worker_list_models,
             worker_start_session,
@@ -3084,7 +3335,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         quill_keys.sort_unstable();
-        assert_eq!(quill_keys, ["quillCommand", "quillCommandError"]);
+        assert_eq!(quill_keys, ["quillCommand", "quillCommandError", "quillDefaultMode", "quillDictationCleanup", "quillEnabled"]);
         let stored = serde_json::to_value(AppSettings::default()).unwrap();
         let stored_keys: Vec<&str> = stored
             .as_object()
@@ -3093,6 +3344,492 @@ mod tests {
             .filter(|key| key.to_lowercase().contains("quill"))
             .map(String::as_str)
             .collect();
-        assert_eq!(stored_keys, ["quillCommand"]);
+        assert_eq!(stored_keys, ["quillCommand", "quillDefaultMode", "quillDictationCleanup", "quillEnabled"]);
+    }
+
+    // ---- quill hook surfaces --------------------------------------------------------------
+
+    use std::{cell::RefCell, rc::Rc};
+
+    #[cfg(target_os = "macos")]
+    async fn quill_hook_off_run(enabled: bool) -> (Result<(), QuillCommandError>, bool, bool) {
+        let dir = quill_test_dir();
+        let command = quill_test_file(&dir, 0o700);
+        let state = quill_test_state(AppSettings {
+            quill_command: command.to_string_lossy().to_string(),
+            quill_enabled: enabled,
+            ..AppSettings::default()
+        });
+        let called = AtomicBool::new(false);
+        let result = with_quill(&state, |_, _, _| {
+            called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        })
+        .await;
+        let slot_empty = state.quill.lock().await.is_none();
+        fs::remove_dir_all(dir).unwrap();
+        (result, called.load(Ordering::SeqCst), slot_empty)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn quill_hook_off_with_quill_returns_disabled_before_the_closure() {
+        let (result, called, slot_empty) = quill_hook_off_run(false).await;
+        assert_eq!(result.unwrap_err().code, quill_client::QuillErrorCode::Disabled);
+        assert!(!called, "nothing is leased or spawned while the hook is off");
+        assert!(slot_empty);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn quill_hook_off_with_quill_runs_the_closure_when_enabled() {
+        let (result, called, slot_empty) = quill_hook_off_run(true).await;
+        assert!(result.is_ok());
+        assert!(called);
+        assert!(slot_empty, "the closure here spawns nothing");
+    }
+
+    const QUILL_TEST_MODELS: [&str; 6] = [
+        "whisper-base-local",
+        "whisper-tiny-local",
+        "whisper-turbo-local",
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe",
+        "gpt-realtime-transcribe",
+    ];
+
+    #[test]
+    fn quill_settings_missing_keys_load_the_defaults() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"openaiApiKey":"","transcriptionModel":"gpt-4o-transcribe","refineEnabled":true,"recordingShortcut":"Control+Alt+Space"}"#,
+        )
+        .unwrap();
+        assert!(!settings.quill_enabled);
+        assert_eq!(settings.quill_default_mode, "task-claude");
+        assert!(!settings.quill_dictation_cleanup);
+        let defaults = AppSettings::default();
+        assert!(!defaults.quill_enabled);
+        assert_eq!(defaults.quill_default_mode, "task-claude");
+        assert!(!defaults.quill_dictation_cleanup);
+    }
+
+    #[test]
+    fn quill_settings_save_round_trips() {
+        let settings = AppSettings {
+            quill_enabled: true,
+            quill_default_mode: "proofread".to_string(),
+            quill_dictation_cleanup: true,
+            ..AppSettings::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["quillEnabled"], true);
+        assert_eq!(value["quillDefaultMode"], "proofread");
+        assert_eq!(value["quillDictationCleanup"], true);
+        let loaded: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(loaded.quill_enabled);
+        assert_eq!(loaded.quill_default_mode, "proofread");
+        assert!(loaded.quill_dictation_cleanup);
+        let frontend = serde_json::to_value(frontend_settings_from(&loaded)).unwrap();
+        assert_eq!(frontend["quillEnabled"], true);
+        assert_eq!(frontend["quillDefaultMode"], "proofread");
+        assert_eq!(frontend["quillDictationCleanup"], true);
+    }
+
+    #[test]
+    fn quill_settings_save_applies_the_three_options() {
+        let mut settings = AppSettings::default();
+        apply_quill_settings(&mut settings, None, None, None).unwrap();
+        assert!(!settings.quill_enabled);
+        assert_eq!(settings.quill_default_mode, "task-claude");
+        apply_quill_settings(&mut settings, Some("dictation-cleanup".to_string()), Some(true), Some(true))
+            .unwrap();
+        assert!(settings.quill_enabled);
+        assert!(settings.quill_dictation_cleanup);
+        assert_eq!(settings.quill_default_mode, "dictation-cleanup");
+    }
+
+    #[test]
+    fn quill_settings_refuse_a_bad_default_mode() {
+        for bad in ["", "Task-claude", "task_claude", "task claude", "tâsk", &"a".repeat(65)] {
+            let mut settings = AppSettings::default();
+            assert!(
+                apply_quill_settings(&mut settings, Some(bad.to_string()), Some(true), Some(true)).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert_eq!(settings.quill_default_mode, "task-claude", "a refused save changes nothing");
+            assert!(!settings.quill_enabled, "a refused save changes nothing");
+        }
+        for good in ["a", "task-claude", "mode-2", &"z".repeat(64)] {
+            let mut settings = AppSettings::default();
+            apply_quill_settings(&mut settings, Some(good.to_string()), None, None).unwrap();
+            assert_eq!(settings.quill_default_mode, good);
+        }
+    }
+
+    #[test]
+    fn quill_settings_model_streams_only_for_realtime() {
+        for model in QUILL_TEST_MODELS {
+            assert!(is_supported_transcription_model(model));
+            assert_eq!(model_streams(model), model == "gpt-realtime-transcribe", "{model}");
+        }
+        assert!(!model_streams(""));
+        assert!(!model_streams("gpt-realtime"));
+    }
+
+    #[test]
+    fn quill_settings_cleanup_effective_needs_enabled_valid_and_cleanup() {
+        for enabled in [false, true] {
+            for valid in [false, true] {
+                for cleanup in [false, true] {
+                    let settings = AppSettings {
+                        quill_enabled: enabled,
+                        quill_dictation_cleanup: cleanup,
+                        ..AppSettings::default()
+                    };
+                    let error = (!valid).then_some("Quill command must be an absolute path.");
+                    assert_eq!(
+                        cleanup_effective(&settings, error),
+                        enabled && valid && cleanup,
+                        "enabled={enabled} valid={valid} cleanup={cleanup}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quill_settings_refine_enabled_follows_the_settings_matrix() {
+        // (quillEnabled, command valid, cleanup, model streams): None is "as today".
+        let matrix: [(bool, Option<bool>, Option<bool>, Option<bool>, Option<bool>); 5] = [
+            (false, None, None, None, None),
+            (true, Some(false), None, None, None),
+            (true, Some(true), Some(false), None, None),
+            (true, Some(true), Some(true), Some(false), Some(false)),
+            (true, Some(true), Some(true), Some(true), None),
+        ];
+        let any = |value: Option<bool>| value.map_or(vec![false, true], |value| vec![value]);
+        let mut rows = 0;
+        for (enabled, valid, cleanup, streams, sent) in matrix {
+            for valid in any(valid) {
+                for cleanup in any(cleanup) {
+                    for model in QUILL_TEST_MODELS {
+                        let model_is_streaming = model == "gpt-realtime-transcribe";
+                        if streams.is_some_and(|streams| streams != model_is_streaming) {
+                            continue;
+                        }
+                        for requested in [false, true] {
+                            let settings = AppSettings {
+                                transcription_model: model.to_string(),
+                                refine_enabled: requested,
+                                quill_enabled: enabled,
+                                quill_dictation_cleanup: cleanup,
+                                ..AppSettings::default()
+                            };
+                            let error = (!valid).then_some("Quill command must be an absolute path.");
+                            let expected =
+                                sent.unwrap_or_else(|| refinement_enabled_for_model(model, requested));
+                            assert_eq!(
+                                session_refine_enabled(&settings, error),
+                                expected,
+                                "enabled={enabled} valid={valid} cleanup={cleanup} model={model} requested={requested}"
+                            );
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 2 * 2 * 6 * 2 + 2 * 6 * 2 + 6 * 2 + 5 * 2 + 2);
+    }
+
+    #[test]
+    fn quill_settings_quill_only_change_keeps_the_live_worker() {
+        let previous = AppSettings::default();
+        let updated = AppSettings {
+            quill_enabled: true,
+            quill_default_mode: "proofread".to_string(),
+            quill_dictation_cleanup: true,
+            ..previous.clone()
+        };
+        assert!(!worker_settings_changed(&previous, &updated));
+    }
+
+    #[derive(Default)]
+    struct QuillTestClipboard {
+        text: Option<String>,
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl QuillClipboard for QuillTestClipboard {
+        fn text(&mut self) -> Option<String> {
+            self.text.clone()
+        }
+
+        fn set_text(&mut self, text: &str) -> bool {
+            self.log.borrow_mut().push(format!("set {text}"));
+            self.text = Some(text.to_string());
+            true
+        }
+    }
+
+    fn quill_clipboard_slot(saved: Option<&str>) -> std::sync::Mutex<Option<String>> {
+        let slot = std::sync::Mutex::new(None);
+        let mut clipboard = QuillTestClipboard {
+            text: saved.map(str::to_string),
+            ..QuillTestClipboard::default()
+        };
+        quill_clipboard_hold_with(&slot, Some(&mut clipboard)).unwrap();
+        slot
+    }
+
+    /// Releases with the clipboard holding `current`; returns the log and the final text.
+    async fn quill_clipboard_run(
+        slot: &std::sync::Mutex<Option<String>>,
+        restore: bool,
+        pasted: &str,
+        current: Option<&str>,
+    ) -> (Vec<String>, Option<String>) {
+        let log = Rc::new(RefCell::new(vec![]));
+        let clipboard = Rc::new(RefCell::new(None));
+        let sleep_log = log.clone();
+        let made = clipboard.clone();
+        let make_log = log.clone();
+        quill_clipboard_release_with(
+            slot,
+            restore,
+            pasted,
+            |delay| {
+                sleep_log.borrow_mut().push(format!("sleep {}", delay.as_millis()));
+                async {}
+            },
+            || {
+                make_log.borrow_mut().push("read".to_string());
+                Some(QuillClipboardProbe {
+                    inner: QuillTestClipboard {
+                        text: current.map(str::to_string),
+                        log: make_log.clone(),
+                    },
+                    out: made,
+                })
+            },
+        )
+        .await
+        .unwrap();
+        let text = clipboard.borrow().clone();
+        let log = log.borrow().clone();
+        (log, text.or(current.map(str::to_string)))
+    }
+
+    struct QuillClipboardProbe {
+        inner: QuillTestClipboard,
+        out: Rc<RefCell<Option<String>>>,
+    }
+
+    impl QuillClipboard for QuillClipboardProbe {
+        fn text(&mut self) -> Option<String> {
+            self.inner.text()
+        }
+
+        fn set_text(&mut self, text: &str) -> bool {
+            *self.out.borrow_mut() = Some(text.to_string());
+            self.inner.set_text(text)
+        }
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_release_waits_300_ms_before_restoring() {
+        let slot = quill_clipboard_slot(Some("original"));
+        let (log, text) = quill_clipboard_run(&slot, true, "pasted", Some("pasted")).await;
+        assert_eq!(log, vec!["sleep 300", "read", "set original"]);
+        assert_eq!(text.as_deref(), Some("original"));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_restores_after_an_inserted_paste() {
+        let slot = quill_clipboard_slot(Some("what the user had copied"));
+        let (_, text) = quill_clipboard_run(&slot, true, "rewritten transcript", Some("rewritten transcript")).await;
+        assert_eq!(text.as_deref(), Some("what the user had copied"));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_no_restore_when_restore_is_false() {
+        let slot = quill_clipboard_slot(Some("original"));
+        let (log, text) = quill_clipboard_run(&slot, false, "pasted", Some("pasted")).await;
+        assert!(log.is_empty(), "nothing is read or written: {log:?}");
+        assert_eq!(text.as_deref(), Some("pasted"));
+        assert!(slot.lock().unwrap().is_none(), "release always empties the slot");
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_no_restore_when_the_user_copied_since() {
+        let slot = quill_clipboard_slot(Some("original"));
+        let (log, text) = quill_clipboard_run(&slot, true, "pasted", Some("a newer copy")).await;
+        assert!(!log.iter().any(|line| line.starts_with("set")), "{log:?}");
+        assert_eq!(text.as_deref(), Some("a newer copy"));
+        assert!(slot.lock().unwrap().is_none());
+        let slot = quill_clipboard_slot(Some("original"));
+        let (log, _) = quill_clipboard_run(&slot, true, "pasted", None).await;
+        assert!(!log.iter().any(|line| line.starts_with("set")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_non_text_saves_nothing() {
+        let slot = quill_clipboard_slot(None);
+        assert!(slot.lock().unwrap().is_none());
+        let (log, _) = quill_clipboard_run(&slot, true, "pasted", Some("pasted")).await;
+        assert!(log.is_empty(), "{log:?}");
+        let unavailable = std::sync::Mutex::new(Some("stale".to_string()));
+        quill_clipboard_hold_with::<QuillTestClipboard>(&unavailable, None).unwrap();
+        assert!(unavailable.lock().unwrap().is_none(), "no clipboard saves nothing");
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_second_hold_replaces_the_first() {
+        let slot = quill_clipboard_slot(Some("first"));
+        let mut clipboard = QuillTestClipboard {
+            text: Some("second".to_string()),
+            ..QuillTestClipboard::default()
+        };
+        quill_clipboard_hold_with(&slot, Some(&mut clipboard)).unwrap();
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("second"));
+        let (_, text) = quill_clipboard_run(&slot, true, "pasted", Some("pasted")).await;
+        assert_eq!(text.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn quill_clipboard_release_always_empties_the_slot() {
+        for (restore, current) in [(true, Some("pasted")), (true, Some("other")), (false, Some("pasted")), (true, None)] {
+            let slot = quill_clipboard_slot(Some("original"));
+            quill_clipboard_run(&slot, restore, "pasted", current).await;
+            assert!(slot.lock().unwrap().is_none(), "restore={restore} current={current:?}");
+        }
+        let slot = quill_clipboard_slot(Some("original"));
+        quill_clipboard_release_with::<QuillTestClipboard, _, _, _>(
+            &slot,
+            true,
+            "pasted",
+            |_| async {},
+            || None,
+        )
+        .await
+        .unwrap();
+        assert!(slot.lock().unwrap().is_none(), "an unavailable clipboard still empties the slot");
+    }
+
+    #[test]
+    fn quill_clipboard_commands_return_no_text() {
+        fn returns_nothing<F: std::future::Future<Output = Result<(), String>>>(_: fn(bool, String) -> F) {}
+        let _: fn() -> Result<(), String> = quill_clipboard_hold;
+        returns_nothing(quill_clipboard_release);
+    }
+
+    // ---- also copy dictations to clipboard ------------------------------------------------
+
+    #[test]
+    fn dictation_copy_settings_missing_key_loads_false() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"openaiApiKey":"","transcriptionModel":"gpt-4o-transcribe","refineEnabled":true,"recordingShortcut":"Control+Alt+Space"}"#,
+        )
+        .unwrap();
+        assert!(!settings.copy_dictations_to_clipboard);
+        assert!(!AppSettings::default().copy_dictations_to_clipboard);
+        let frontend = serde_json::to_value(frontend_settings_from(&settings)).unwrap();
+        assert_eq!(frontend["copyDictationsToClipboard"], false);
+    }
+
+    #[test]
+    fn dictation_copy_settings_save_with_true_round_trips() {
+        let mut settings = AppSettings::default();
+        apply_dictation_copy(&mut settings, Some(true));
+        assert!(settings.copy_dictations_to_clipboard);
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["copyDictationsToClipboard"], true);
+        let loaded: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(loaded.copy_dictations_to_clipboard);
+        let frontend = serde_json::to_value(frontend_settings_from(&loaded)).unwrap();
+        assert_eq!(frontend["copyDictationsToClipboard"], true);
+    }
+
+    #[test]
+    fn dictation_copy_settings_save_with_none_keeps_the_stored_value() {
+        for stored in [false, true] {
+            let mut settings = AppSettings {
+                copy_dictations_to_clipboard: stored,
+                ..AppSettings::default()
+            };
+            apply_dictation_copy(&mut settings, None);
+            assert_eq!(settings.copy_dictations_to_clipboard, stored);
+        }
+        let mut settings = AppSettings {
+            copy_dictations_to_clipboard: true,
+            ..AppSettings::default()
+        };
+        apply_dictation_copy(&mut settings, Some(false));
+        assert!(!settings.copy_dictations_to_clipboard);
+    }
+
+    #[test]
+    fn dictation_copy_settings_load_beside_the_quill_keys() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"openaiApiKey":"","transcriptionModel":"gpt-4o-transcribe","quillCommand":"/opt/quill/bin/quill","quillDefaultMode":"proofread","quillDictationCleanup":true,"quillEnabled":true,"copyDictationsToClipboard":true}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.quill_command, "/opt/quill/bin/quill");
+        assert_eq!(settings.quill_default_mode, "proofread");
+        assert!(settings.quill_dictation_cleanup);
+        assert!(settings.quill_enabled);
+        assert!(settings.copy_dictations_to_clipboard);
+        let frontend = serde_json::to_value(frontend_settings_from(&settings)).unwrap();
+        assert_eq!(frontend["quillCommand"], "/opt/quill/bin/quill");
+        assert_eq!(frontend["quillDefaultMode"], "proofread");
+        assert_eq!(frontend["quillDictationCleanup"], true);
+        assert_eq!(frontend["quillEnabled"], true);
+        assert_eq!(frontend["copyDictationsToClipboard"], true);
+    }
+
+    #[test]
+    fn dictation_copy_settings_only_change_keeps_the_live_worker() {
+        let previous = AppSettings::default();
+        let updated = AppSettings {
+            copy_dictations_to_clipboard: true,
+            ..previous.clone()
+        };
+        assert!(!worker_settings_changed(&previous, &updated));
+        assert!(!worker_settings_changed(&updated, &previous));
+    }
+
+    /// A save of only this field: `app_save_settings` registers a shortcut only for a requested
+    /// recording shortcut and starts or drops the quill client only when `quill_enabled`
+    /// changes, so settings that differ in this field alone do neither.
+    #[test]
+    fn dictation_copy_settings_only_save_changes_no_other_setting() {
+        for (quill_enabled, copy) in [(false, true), (true, true), (true, false), (false, false)] {
+            let previous = AppSettings {
+                quill_enabled,
+                quill_dictation_cleanup: quill_enabled,
+                copy_dictations_to_clipboard: !copy,
+                ..AppSettings::default()
+            };
+            let mut updated = previous.clone();
+            apply_quill_command(&mut updated, None);
+            apply_quill_settings(&mut updated, None, None, None).unwrap();
+            apply_dictation_copy(&mut updated, Some(copy));
+            let before = serde_json::to_value(&previous).unwrap();
+            let after = serde_json::to_value(&updated).unwrap();
+            let changed: Vec<&str> = before
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, value)| after.get(key.as_str()) != Some(*value))
+                .map(|(key, _)| key.as_str())
+                .collect();
+            assert_eq!(changed, ["copyDictationsToClipboard"], "quill_enabled={quill_enabled} copy={copy}");
+            assert_eq!(before.as_object().unwrap().len(), after.as_object().unwrap().len());
+            assert_eq!(previous.quill_enabled, updated.quill_enabled, "the quill client is neither started nor dropped");
+            assert_eq!(previous.recording_shortcut, updated.recording_shortcut, "no shortcut is registered");
+            assert!(!worker_settings_changed(&previous, &updated));
+        }
     }
 }
