@@ -300,3 +300,392 @@ describe("desktop regression contracts", () => {
     expect(css).not.toContain(".recording-transcript-body");
   });
 });
+
+import { existsSync } from "node:fs";
+
+describe("quill-settings", () => {
+  const main = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
+  const native = readFileSync(resolve(desktopRoot, "src-tauri/src/lib.rs"), "utf8");
+
+  it("uses menu-toggle-row with aria-labels for both quill toggles", () => {
+    const rows = Array.from(main.matchAll(/<div class="menu-toggle-row">([\s\S]*?)<\/label>/g), (match) => match[1]);
+    expect(rows.some((row) => row.includes('aria-label="Rewrite with quill"') && row.includes(">Rewrite with quill</span>"))).toBe(true);
+    expect(rows.some((row) => row.includes('aria-label="Clean up dictations"') && row.includes(">Clean up dictations</span>"))).toBe(true);
+  });
+
+  it("has a quill error row that is hidden when the error is null", () => {
+    expect(main).toContain('<div id="menu-quill-error" class="menu-prompt-hint" role="alert" style="display:none"></div>');
+    expect(main).toContain('menuQuillError.style.display = error ? "" : "none"');
+  });
+
+  it("removes the refine block from main.ts", () => {
+    expect(main).not.toContain("menu-refine-settings");
+    expect(main).not.toContain("menu-refine-toggle");
+    expect(main).not.toContain("menu-refine-prompt-input");
+  });
+
+  it("keeps refineEnabled and refinePrompt in the type, the fallback and the Rust settings", () => {
+    const type = main.match(/type AppSettings = \{([\s\S]*?)\n\};/)?.[1];
+    expect(type).toContain("refineEnabled: boolean;");
+    expect(type).toContain("refinePrompt: string;");
+    expect(main).toContain('refineEnabled: false, refinePrompt: ""');
+    const rust = native.match(/struct AppSettings \{([\s\S]*?)\n\}/)?.[1];
+    expect(rust).toContain("refine_enabled: bool,");
+    expect(rust).toContain("refine_prompt: String,");
+  });
+
+  it("names only gpt-realtime-transcribe as streaming in Rust and TypeScript", () => {
+    const rust = native.match(/fn model_streams\(model: &str\) -> bool \{([\s\S]*?)\n\}/)?.[1];
+    expect(rust).toBeDefined();
+    expect(Array.from(rust!.matchAll(/"([^"]*)"/g), (match) => match[1])).toEqual(["gpt-realtime-transcribe"]);
+    const line18 = readFileSync(resolve(import.meta.dirname, "transcription-model.ts"), "utf8").split("\n")[17];
+    expect(line18).toContain("streamsText");
+    expect(Array.from(line18.matchAll(/"([^"]*)"/g), (match) => match[1])).toEqual(["gpt-realtime-transcribe"]);
+  });
+
+  it("disables Clean up dictations while the hook is off or invalid", () => {
+    expect(main).toContain("menuQuillCleanupToggle.disabled = !quillHookReady(");
+  });
+});
+
+describe("quill-cut", () => {
+  const source = (path: string) => readFileSync(resolve(desktopRoot, path), "utf8");
+  const native = () => source("src-tauri/src/lib.rs");
+  const main = () => source("src/main.ts");
+  const surfaces = () => source("src/quill-surfaces.ts");
+  const styles = () => source("src/styles.css");
+
+  /** Every name `quill-surfaces.ts` exports, read from its source text. */
+  const exportedNames = (text: string) => {
+    const names = new Set<string>();
+    for (const match of text.matchAll(
+      /\bexport\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|function\*?|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/g,
+    )) {
+      names.add(match[1]);
+    }
+    for (const match of text.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}/g)) {
+      for (const part of match[1].split(",")) {
+        const name = part.trim().split(/\s+as\s+/).pop()?.replace(/^type\s+/, "").trim();
+        if (name) names.add(name);
+      }
+    }
+    return names;
+  };
+
+  const handlerNames = (text: string) => {
+    const handler = text.match(/tauri::generate_handler!\[([\s\S]*?)\]/)?.[1];
+    expect(handler).toBeDefined();
+    return handler!.split(",").map((name) => name.trim()).filter(Boolean);
+  };
+
+  const WITHDRAWN_EXPORTS = [
+    "QuillPicker",
+    "QuillPickerKey",
+    "QuillPickerView",
+    "QuillHotkey",
+    "QuillRewritten",
+    "QuillRevertSlot",
+    "QuillRevertView",
+    "hotkeySlotAllowed",
+    "openSlotAfterDictation",
+    "QUILL_PRESS_WINDOW_MS",
+    "QUILL_PICKER_IDLE_MS",
+    "QUILL_REVERT_WINDOW_MS",
+    "QUILL_STILL_REWRITING",
+    "QUILL_REVERT_COPIED",
+    "QUILL_CLIPBOARD_REPLACED",
+  ];
+
+  const MODE_SELECT_EXPORTS = [
+    "loadModeSelect",
+    "QuillModeSelect",
+    "QUILL_MODE_HINT",
+    "QuillCatalog",
+    "effectiveMode",
+    "orderModes",
+    "modeName",
+  ];
+
+  const HOOK_CORE_COMMANDS = [
+    "quill_rewrite_selection",
+    "quill_rewrite_text",
+    "quill_revert",
+    "quill_report_outcome",
+    "quill_list_modes",
+  ];
+
+  // Hook-core's two selection commands as they stand at 93e4234, held verbatim.
+  const QUILL_REWRITE_SELECTION_AT_BASE = `async fn quill_rewrite_selection(
+    state: State<'_, Arc<AppState>>,
+    mode: String,
+    pressed_at_ms: u64,
+) -> Result<QuillRewriteSelectionResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(async move {
+                quill_client::run_rewrite_selection(
+                    slot,
+                    command,
+                    env,
+                    &mut quill_client::NativeHost,
+                    &mode,
+                    pressed_at_ms,
+                )
+                .await
+            })
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, mode, pressed_at_ms);
+        Err(quill_unsupported())
+    }
+}`;
+
+  const QUILL_REVERT_AT_BASE = `async fn quill_revert(
+    state: State<'_, Arc<AppState>>,
+    rewrite_id: String,
+    delivered: Option<String>,
+) -> Result<QuillRevertResult, QuillCommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_quill(&state, |slot, command, env| {
+            Box::pin(async move {
+                quill_client::run_revert(
+                    slot,
+                    command,
+                    env,
+                    &mut quill_client::NativeHost,
+                    &rewrite_id,
+                    delivered.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&state, rewrite_id, delivered);
+        Err(quill_unsupported())
+    }
+}`;
+
+  it("has no picker or revert command, revert arming or revert key in lib.rs", () => {
+    const rust = native();
+    for (const name of ["quill_picker_open", "quill_picker_close", "quill_revert_arm", "quill_revert_armed", "arm_revert", "KeyZ"]) {
+      expect(rust, name).not.toContain(name);
+    }
+  });
+
+  it("has no hotkey listener, picker or revert slot in main.ts", () => {
+    const text = main();
+    for (const name of ["quill-picker", "quill-revert", "quill-rewrite", "QuillHotkey"]) {
+      expect(text, name).not.toContain(name);
+    }
+    for (const name of ["quill_picker_open", "quill_picker_close", "quill_revert_arm", "quill_revert_armed"]) {
+      expect(text, name).not.toContain(name);
+    }
+  });
+
+  it("exports no hotkey, picker or revert-slot name from quill-surfaces.ts", () => {
+    const text = surfaces();
+    const names = exportedNames(text);
+    expect(names.size).toBeGreaterThan(0);
+    for (const name of WITHDRAWN_EXPORTS) {
+      expect(names.has(name), name).toBe(false);
+    }
+    for (const name of ["quill_picker_open", "quill_picker_close", "quill_revert_arm", "quill_revert_armed"]) {
+      expect(text, name).not.toContain(name);
+    }
+  });
+
+  it("has no default-mode select in main.ts", () => {
+    const text = main();
+    for (const name of ["menu-quill-mode", "quillDefaultMode", "loadModeSelect", "QuillCatalog", "quill_list_modes"]) {
+      expect(text, name).not.toContain(name);
+    }
+  });
+
+  it("exports no mode-select name from quill-surfaces.ts and never names quillDefaultMode", () => {
+    const text = surfaces();
+    const names = exportedNames(text);
+    for (const name of MODE_SELECT_EXPORTS) {
+      expect(names.has(name), name).toBe(false);
+    }
+    expect(text).not.toContain("quillDefaultMode");
+  });
+
+  it("still exports QUILL_NOTICES and quillNotice from quill-surfaces.ts", () => {
+    const names = exportedNames(surfaces());
+    expect(names.has("QUILL_NOTICES")).toBe(true);
+    expect(names.has("quillNotice")).toBe(true);
+  });
+
+  it("still names every hook-core command in generate_handler!, and no withdrawn quill command", () => {
+    const names = handlerNames(native());
+    for (const command of HOOK_CORE_COMMANDS) {
+      expect(names, command).toContain(command);
+    }
+    expect(names.filter((name) => name.startsWith("quill_")).sort()).toEqual(
+      [...HOOK_CORE_COMMANDS, "quill_clipboard_hold", "quill_clipboard_release"].sort(),
+    );
+  });
+
+  it("keeps quill_rewrite_selection and quill_revert as they stand at 93e4234", () => {
+    const rust = native();
+    expect(QUILL_REWRITE_SELECTION_AT_BASE.startsWith("async fn quill_rewrite_selection(")).toBe(true);
+    expect(QUILL_REVERT_AT_BASE.startsWith("async fn quill_revert(")).toBe(true);
+    expect(rust).toContain(`#[tauri::command]\n${QUILL_REWRITE_SELECTION_AT_BASE}`);
+    expect(rust).toContain(`#[tauri::command]\n${QUILL_REVERT_AT_BASE}`);
+  });
+
+  it("has no picker or revert-slot rule in styles.css, and keeps the rules kept code uses", () => {
+    const css = styles();
+    expect(css).not.toContain("quill-picker");
+    expect(css).not.toContain("quill-revert");
+    expect(css).toMatch(/^\.visually-hidden \{$/m);
+    expect(css).toMatch(/^\.toast\[role="alert"\] \{$/m);
+  });
+
+  it("does not create the hotkey, picker or revert test files", () => {
+    for (const file of ["quill-hotkey.test.ts", "quill-picker.test.ts", "quill-revert.test.ts"]) {
+      expect(existsSync(resolve(desktopRoot, "src", file)), file).toBe(false);
+    }
+  });
+});
+
+describe("dictation-copy-settings", () => {
+  const main = () => readFileSync(resolve(desktopRoot, "src/main.ts"), "utf8");
+  const native = () => readFileSync(resolve(desktopRoot, "src-tauri/src/lib.rs"), "utf8");
+
+  const LABEL = "Also copy dictations to clipboard";
+  const INPUT = `<input id="menu-copy-dictations-toggle" type="checkbox" aria-label="${LABEL}" />`;
+  const QUILL_BLOCK_END = '<div id="menu-quill-error" class="menu-prompt-hint" role="alert" style="display:none"></div>';
+
+  /** The toggle's row, from its `menu-toggle-row` opening tag to the row's closing tag. */
+  const toggleRow = (text: string) => {
+    const rows = Array.from(text.matchAll(/<div class="menu-toggle-row">[\s\S]*?<\/label>\s*<\/div>/g), (match) => match[0]);
+    const matching = rows.filter((row) => row.includes("menu-copy-dictations-toggle"));
+    expect(matching).toHaveLength(1);
+    return matching[0];
+  };
+
+  /** The name main.ts gives the toggle's element. */
+  const toggleElement = (text: string) => {
+    const name = text.match(/const (\w+) = document\.getElementById\("menu-copy-dictations-toggle"\) as HTMLInputElement;/)?.[1];
+    expect(name).toBeDefined();
+    return name!;
+  };
+
+  // The two clipboard commands as they stand at 93e4234, held verbatim.
+  const COPY_TO_CLIPBOARD_AT_BASE = `fn copy_to_clipboard(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text))
+        .map_err(|e| e.to_string())
+}`;
+
+  const PASTE_TO_TARGET_AT_BASE = `async fn paste_to_target(text: String) -> Result<PasteResult, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(&text))
+        .map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    return Ok(macos_text_inserter::paste_to_captured_target(&text));
+
+    #[cfg(target_os = "windows")]
+    {
+        text_inserter::restore_and_paste();
+        Ok(PasteResult {
+            pasted: true,
+            reason: None,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    Ok(PasteResult {
+        pasted: false,
+        reason: Some("unsupported_target"),
+    })
+}`;
+
+  it("puts the toggle in a menu-toggle-row with its label", () => {
+    const row = toggleRow(main());
+    expect(row.startsWith('<div class="menu-toggle-row">')).toBe(true);
+    expect(row).toContain(`>${LABEL}</span>`);
+    expect(row).toContain('<label class="toggle-switch"');
+  });
+
+  it("gives the input its id and aria-label, and never a disabled attribute", () => {
+    const text = main();
+    const row = toggleRow(text);
+    expect(row).toContain(INPUT);
+    expect(text.split('id="menu-copy-dictations-toggle"')).toHaveLength(2);
+    const input = row.match(/<input[^>]*>/g);
+    expect(input).toHaveLength(1);
+    expect(input![0]).not.toContain("disabled");
+  });
+
+  it("places the row right after the quill block's closing markup", () => {
+    const text = main();
+    const end = text.indexOf(QUILL_BLOCK_END);
+    expect(end).toBeGreaterThan(0);
+    const row = toggleRow(text);
+    const at = text.indexOf(row);
+    expect(at).toBeGreaterThan(end);
+    expect(text.slice(end + QUILL_BLOCK_END.length, at).trim()).toBe("");
+    for (const id of ["menu-quill-enabled-toggle", "menu-quill-cleanup-toggle", "menu-quill-error"]) {
+      expect(text.indexOf(`id="${id}"`), id).toBeLessThan(at);
+      expect(text.indexOf(`id="${id}"`, at), id).toBe(-1);
+    }
+  });
+
+  it("saves copyDictationsToClipboard on change and shows exactly Copy dictations on or off", () => {
+    const text = main();
+    const element = toggleElement(text);
+    const start = text.indexOf(`${element}.addEventListener("change", () => {`);
+    expect(start).toBeGreaterThan(0);
+    const handler = text.slice(start, text.indexOf("\n});\n", start));
+    expect(handler).toMatch(
+      new RegExp(`const (\\w+) = ${element}\\.checked;\\s*void saveQuillSettings\\(\\{ copyDictationsToClipboard: \\1 \\}, \\1 \\? "Copy dictations on" : "Copy dictations off"\\);`),
+    );
+    expect(text.split('"Copy dictations on"')).toHaveLength(2);
+    expect(text.split('"Copy dictations off"')).toHaveLength(2);
+    expect(text).toContain('const updated = await invoke<AppSettings>("app_save_settings", update);');
+  });
+
+  it("shows the stored value: checked comes from copyDictationsToClipboard ?? false", () => {
+    const text = main();
+    const element = toggleElement(text);
+    expect(text).toContain(`${element}.checked = settings.copyDictationsToClipboard ?? false;`);
+  });
+
+  it("never assigns disabled on the toggle's element", () => {
+    const text = main();
+    const element = toggleElement(text);
+    expect(text).not.toContain(`${element}.disabled`);
+    expect(text).not.toMatch(new RegExp(`${element}\\.(?:setAttribute|toggleAttribute)\\("disabled"`));
+  });
+
+  it("declares copyDictationsToClipboard in the AppSettings type", () => {
+    const type = main().match(/type AppSettings = \{([\s\S]*?)\n\};/)?.[1];
+    expect(type).toContain("copyDictationsToClipboard?: boolean;");
+  });
+
+  it("keeps copy_to_clipboard and paste_to_target as they stand at 93e4234", () => {
+    const rust = native();
+    expect(COPY_TO_CLIPBOARD_AT_BASE.startsWith("fn copy_to_clipboard(text: String)")).toBe(true);
+    expect(PASTE_TO_TARGET_AT_BASE.startsWith("async fn paste_to_target(text: String)")).toBe(true);
+    expect(rust).toContain(`#[tauri::command]\n${COPY_TO_CLIPBOARD_AT_BASE}`);
+    expect(rust).toContain(`#[tauri::command]\n${PASTE_TO_TARGET_AT_BASE}`);
+  });
+
+  it("adds no history exclusion, transient type or concealed type to any clipboard write", () => {
+    const rust = native();
+    for (const name of ["exclude_from_history", "TransientType", "ConcealedType"]) {
+      expect(rust, name).not.toContain(name);
+    }
+  });
+});

@@ -1136,3 +1136,61 @@ body {
     transform: rotate(360deg);
   }
 }
+
+/* ===== Quill: rewriting state ===== */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+#widget[data-expanded="true"][data-state="rewriting"] .meter,
+#widget[data-expanded="true"][data-state="rewriting"] .meter-idle-wave {
+  opacity: 1;
+  display: block;
+}
+
+[data-state="rewriting"] .meter-canvas {
+  display: none;
+}
+
+[data-state="rewriting"] .record-control .icon-dots {
+  opacity: 0;
+}
+
+[data-state="rewriting"] .record-control .icon-spin {
+  opacity: 1;
+  color: var(--accent-strong);
+}
+
+#widget[data-state="rewriting"] .mic-btn {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* One non-looping cue when the dictation rewrite starts. */
+#widget[data-state="rewriting"] .meter-idle-wave {
+  animation: quill-rewriting-cue 900ms ease-out 1;
+}
+
+@keyframes quill-rewriting-cue {
+  0% { opacity: 0.4; transform: scaleX(0.6); }
+  60% { opacity: 1; transform: scaleX(1.08); }
+  100% { opacity: 1; transform: scaleX(1); }
+}
+
+.toast[role="alert"] {
+  border-color: rgba(241, 120, 120, 0.4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #widget[data-state="rewriting"] .meter-idle-wave {
+    animation: none;
+  }
+}
